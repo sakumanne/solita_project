@@ -7,6 +7,7 @@ import torch
 import whisper
 from pyannote.audio import Pipeline
 from pyannote.core import Segment
+import os
 
 # ---------- Config ----------
 TEMP_AUDIO_PATH = "temp_recording.wav"  # Temporary file to store recording
@@ -15,6 +16,7 @@ RECORDING_DURATION = 10  # Recording duration in seconds
 WHISPER_MODEL_SIZE = "small"
 HF_MODEL_ID = "pyannote/speaker-diarization"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # Record audio from microphone
 def record_audio():
@@ -38,8 +40,8 @@ HF_MODEL_ID = "pyannote/speaker-diarization"  # adjust if you use a specific ver
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load Hugging Face token from environment
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "YOUR_HUGGINGFACE_TOKEN")
-if HF_TOKEN == "YOUR_HUGGINGFACE_TOKEN":
+HF_TOKEN = os.getenv("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")
+if HF_TOKEN == "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":
     raise RuntimeError(
         "Missing Hugging Face token. Set HUGGINGFACE_TOKEN in your environment."
     )
