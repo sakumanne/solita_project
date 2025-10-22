@@ -10,7 +10,7 @@ whisper_model = whisper.load_model("small")
 # Requires a Hugging Face token for the pretrained diarization model
 # You can get one free from https://huggingface.co/pyannote/speaker-diarization
 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
-                                    use_auth_token="YOUR_HF_TOKEN")
+                                    use_auth_token="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")
 
 audio_path = "conversation.wav"  # Path to your audio file
 
