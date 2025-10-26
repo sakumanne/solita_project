@@ -1,3 +1,3 @@
 Requirements:
-pip install ultralytics
-New system environment variable for token
+#pip install ultralytics
+#New system environment variable for token
