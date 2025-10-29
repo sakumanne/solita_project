@@ -1,10 +1,13 @@
 from ultralytics import YOLO
 import cv2
+from pathlib import Path   
 
-weights_path = r"train\weights\best.pt"
+weights_path = Path(__file__).resolve().parent / "runs" / "weights_coco8" / "best.pt"
+if not weights_path.exists():
+    raise FileNotFoundError(f"Weights not found: {weights_path}")
 model = YOLO(weights_path)
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(0) 
 if not cap.isOpened():
     raise RuntimeError("Webcam not accessible.")
 
