@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 import cv2
 from pathlib import Path   
-from solita_project.scripts.posescripts.keypointstorer import KeypointWriter, record_if_present
+from scripts.posescripts.keypointstorer import KeypointWriter, record_if_present
 
 weights_path = Path(__file__).resolve().parent / "runs" / "weights_coco8" / "best.pt"
 if not weights_path.exists():

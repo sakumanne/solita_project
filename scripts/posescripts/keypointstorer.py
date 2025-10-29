@@ -72,8 +72,9 @@ class KeypointWriter:
 
     def __init__(self, out_path: Union[str, Path] = None):
         if out_path is None:
-            # default: project/data/keypoints.jsonl (two levels up from this script)
-            base = Path(__file__).resolve().parent.parent
+            # default: project/data/keypoints.jsonl (project root)
+            # resolve project root (two levels up from this script: posescripts -> scripts -> project root)
+            base = Path(__file__).resolve().parents[2]
             out_dir = base / "data"
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / "keypoints.jsonl"
