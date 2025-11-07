@@ -13,3 +13,5 @@ pyvenv.cfg
 .Python
 # End virtualenv ignores
 venv/
+
+data/live_transcriptions.json
