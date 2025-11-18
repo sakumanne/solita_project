@@ -1,19 +1,16 @@
-"""Live speech-to-text helper using OpenAI Whisper.
+"""Live Finnish speech-to-text helper using OpenAI Whisper.
 
 This script records short chunks from the microphone and transcribes them
-as live speech. Only Finnish ("fi") and English ("en") transcription is
-supported, and transcripts containing characters outside these languages
-are rejected. Loud live audio is detected and reported when volume exceeds
-approximately 70 dB, and every chunk's loudness estimate is appended to a
-JSON log for external monitoring.
+as live speech in Finnish. Transcripts containing characters outside the
+Finnish/English alphabet and common punctuation are rejected. Loud live
+audio is detected and reported when volume exceeds approximately 70 dB,
+and every chunk's loudness estimate is appended to a JSON log for external
+monitoring.
 
 Example usages:
 
-    # Launch the live transcription helper (default language: Finnish)
+    # Launch the live transcription helper
     python stt/simple_whisper.py
-
-    # Transcribe live speech in English
-    python stt/simple_whisper.py --language en
 
     # Record and transcribe five-second chunks from the microphone
     python stt/simple_whisper.py --chunk-duration 5
@@ -25,6 +22,7 @@ import argparse
 import json
 import math
 import queue
+import re
 import sys
 import time
 from datetime import datetime
@@ -37,45 +35,25 @@ import whisper
 
 SAMPLE_RATE = 16_000
 LOUD_DB_THRESHOLD = 70.0
+SILENCE_DB_THRESHOLD = -50.0
 DATA_DIR = Path(__file__).parent.parent / "data"
 LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
-SUPPORTED_LANGUAGES: tuple[str, ...] = ("fi", "en")
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("fi",)
 DEFAULT_LANGUAGE = "fi"
-SUPPORTED_CHARACTERS = set("abcdefghijklmnopqrstuvwxyzåäö" "ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ" "0123456789" " .,;:!?\"'()[]{}-/\\@#$%&*+=<>")
+SUPPORTED_CHARACTERS = set(
+    "abcdefghijklmnopqrstuvwxyzåäö"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ"
+    "0123456789"
+    " .,;:!?\"'()[]{}-/\\@#$%&*+=<>"
+)
 LOUDNESS_ALERT_THRESHOLD_DB = 70.0
 
+# Kuinka paljon historiaa syötetään initial_promptiin (merkkejä)
+MAX_HISTORY_CHARS = 500
 
-def dependency_hint(package: str, pip_name: Optional[str] = None) -> str:
-    """Provide a helpful installation hint for the current interpreter."""
-    interpreter = Path(sys.executable).resolve()
-    pip_package = pip_name or package
-    return (
-        f"Missing dependency: '{package}'. Install it for this interpreter with `"
-        f"{interpreter} -m pip install {pip_package}` or `pip install -r requirements.txt`."
-    )
-
-
-try:
-    import numpy as np
-except ModuleNotFoundError as exc:
-    raise SystemExit(dependency_hint("numpy")) from exc
-
-try:
-    import sounddevice as sd
-except ModuleNotFoundError as exc:
-    raise SystemExit(dependency_hint("sounddevice")) from exc
-except OSError as exc:
-    raise SystemExit(
-        "sounddevice could not access the PortAudio backend. "
-        "Install the PortAudio runtime (e.g. `sudo apt install libportaudio2`, "
-        "`brew install portaudio`, or install the official binary on Windows) "
-        "and then re-run the script."
-    ) from exc
-
-try:
-    import whisper
-except ModuleNotFoundError as exc:
-    raise SystemExit(dependency_hint("whisper", pip_name="openai-whisper")) from exc
+INITIAL_PROMPT = (
+    "Tämä on suomenkielinen keskustelu. Käytä suomen kieltä ja kirjakieltä."
+)
 
 
 def is_supported_transcript(text: str) -> bool:
@@ -99,14 +77,41 @@ def load_model(name: str) -> whisper.Whisper:
 AudioInput = Union[np.ndarray, str, Path]
 
 
+def postprocess_transcript(text: str) -> str:
+    """Lightweight cleanup of the transcript (whitespace, casing, etc.)."""
+    text = text.strip()
+    if not text:
+        return text
+
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text)
+
+    # Remove spaces before punctuation like " . , ! ? ; :"
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+
+    # Capitalize first alphabetic character
+    first_alpha_idx: Optional[int] = None
+    for i, ch in enumerate(text):
+        if ch.isalpha():
+            first_alpha_idx = i
+            break
+    if first_alpha_idx is not None:
+        text = (
+            text[:first_alpha_idx]
+            + text[first_alpha_idx].upper()
+            + text[first_alpha_idx + 1 :]
+        )
+
+    return text
+
+
 def transcribe_audio(
     model: whisper.Whisper,
     audio: AudioInput,
-    language: str,
+    history: str = "",
 ) -> str:
     """Run Whisper on an audio buffer or file path and return the transcript."""
-    if language not in SUPPORTED_LANGUAGES:
-        raise ValueError(f"Unsupported language: {language!r}. Supported languages: {SUPPORTED_LANGUAGES}.")
+    language = DEFAULT_LANGUAGE
 
     if isinstance(audio, (np.ndarray, list, tuple)):
         array = np.asarray(audio, dtype=np.float32)
@@ -116,8 +121,26 @@ def transcribe_audio(
     else:
         audio_input = audio
 
-    result = model.transcribe(audio_input, language=language, fp16=False)
-    return result.get("text", "").strip()
+    # Käytä aiempaa historiaa initial_promptina, jos sitä on
+    if history:
+        prompt = history[-MAX_HISTORY_CHARS:]
+    else:
+        prompt = INITIAL_PROMPT
+
+    result = model.transcribe(
+        audio_input,
+        language=language,
+        fp16=False,
+        task="transcribe",
+        temperature=0.0,
+        beam_size=5,
+        best_of=5,
+        initial_prompt=prompt,
+    )
+    transcript = result.get("text", "").strip()
+    transcript = postprocess_transcript(transcript)
+
+    return transcript if is_supported_transcript(transcript) else ""
 
 
 def record_chunks(duration: float) -> Iterable[np.ndarray]:
@@ -179,8 +202,8 @@ def _write_status(timestamp: str, transcript: str, db: float, loud: bool) -> Non
 
 def live_transcription(
     model_name: str,
-    language: Optional[str],
     chunk_duration: float,
+    decibel_log: Path,
 ) -> None:
     """Continuously record microphone audio and monitor sound levels."""
     print(
@@ -190,6 +213,9 @@ def live_transcription(
     model = load_model(model_name)
 
     print(f"Recording in {int(chunk_duration)}-second chunks...", file=sys.stderr)
+
+    history = ""  # kerätään aiempia transkriptioita initial_promptia varten
+
     try:
         for audio_chunk in record_chunks(chunk_duration):
             if not audio_chunk.size:
@@ -201,13 +227,32 @@ def live_transcription(
                 db = float("-inf")
             else:
                 db = 20.0 * math.log10(rms)
-            
-            # Check if sound is loud
-            loud = db >= LOUD_DB_THRESHOLD
 
-            # Transcribe audio
-            transcript = transcribe_audio(model, audio_chunk, language=language)
-            
+            # Log loudness regardless of transcription
+            append_decibel_log_entry(decibel_log, db, LOUD_DB_THRESHOLD)
+
+            # Treat silent chunks as silence without hallucinated text
+            if (not math.isfinite(db)) or db < SILENCE_DB_THRESHOLD:
+                transcript = ""
+                loud = False
+            else:
+                # Check if sound is loud
+                loud = db >= LOUD_DB_THRESHOLD
+
+                # Transcribe audio assuming Finnish speech, käyttäen historiaa
+                transcript = transcribe_audio(model, audio_chunk, history=history)
+
+            # Päivitä historia vain, jos tuli tekstiä
+            if transcript:
+                if history:
+                    history = (history + " " + transcript).strip()
+                else:
+                    history = transcript
+
+                # pidä historia riittävän lyhyenä
+                if len(history) > MAX_HISTORY_CHARS:
+                    history = history[-MAX_HISTORY_CHARS:]
+
             # Write status for monitor
             timestamp = datetime.utcnow().isoformat() + "Z"
             _write_status(timestamp, transcript, db, loud)
@@ -217,7 +262,7 @@ def live_transcription(
                 print(transcript)
             if loud:
                 print(f"WARNING: Loud noise detected ({db:.1f} dB)!", file=sys.stderr)
-                
+
     except KeyboardInterrupt:
         print("\nStopped monitoring and transcription.", file=sys.stderr)
 
@@ -230,16 +275,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Whisper model size to use (tiny, base, small, medium, large).",
     )
     parser.add_argument(
-        "--language",
-        choices=SUPPORTED_LANGUAGES,
-        default=DEFAULT_LANGUAGE,
-        help="Language to transcribe (fi for Finnish, en for English).",
-    )
-    parser.add_argument(
         "--chunk-duration",
         type=float,
-        default=2.0,
-        help="Number of seconds per live recording chunk (default: 2).",
+        default=5.0,
+        help="Number of seconds per live recording chunk (default: 5).",
     )
     parser.add_argument(
         "--decibel-log",
@@ -253,7 +292,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parse_args(argv)
-    live_transcription(args.model, args.language, args.chunk_duration)
+    live_transcription(args.model, args.chunk_duration, args.decibel_log)
 
 
 if __name__ == "__main__":
