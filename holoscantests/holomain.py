@@ -1,11 +1,13 @@
 from holoscan.core import Application, Fragment, Operator, OperatorSpec
 from holoscan.resources import UnboundedAllocator
-import cv2, threading, queue, time, os
+import cv2, threading, queue
+from ultralytics import YOLO
+from pathlib import Path
 
 DISPLAY_Q_SIZE = 8
+STOP_EVENT = threading.Event()
 
 class OpenCVCaptureOp(Operator):
-    """Holoscan source op: captures frames from /dev/video0 using OpenCV."""
     def setup(self, spec: OperatorSpec):
         spec.output("frame")
 
@@ -15,40 +17,56 @@ class OpenCVCaptureOp(Operator):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         if not self.cap.isOpened():
             raise RuntimeError("Webcam /dev/video0 not accessible.")
-        print("[OpenCVCaptureOp] opened /dev/video0", flush=True)
-        self.idx = 0
 
     def stop(self):
         if self.cap.isOpened():
             self.cap.release()
-        print("[OpenCVCaptureOp] released", flush=True)
 
     def compute(self, op_input, op_output, context):
+        if STOP_EVENT.is_set():
+            raise SystemExit
         ok, frame = self.cap.read()
         if not ok:
-            print("[OpenCVCaptureOp] read fail", flush=True)
             return
-        self.idx += 1
-        if self.idx <= 5:
-            cv2.imwrite(f"/tmp/hs_cap_{self.idx}.png", frame)
-            print(f"[OpenCVCaptureOp] saved /tmp/hs_cap_{self.idx}.png", flush=True)
         op_output.emit(frame, "frame")
 
 
+class YOLOPoseOp(Operator):
+    def setup(self, spec: OperatorSpec):
+        spec.input("in")
+        spec.output("out")
+
+    def start(self):
+        weights = Path(__file__).resolve().parent.parent / "runs" / "weights_coco8" / "best.pt"
+        if not weights.exists():
+            raise FileNotFoundError(f"Missing weights: {weights}")
+        self.model = YOLO(str(weights))
+
+    def compute(self, op_input, op_output, context):
+        if STOP_EVENT.is_set():
+            raise SystemExit
+        frame = op_input.receive("in")
+        if frame is None:
+            return
+        results = self.model(frame)
+        annotated = results[0].plot()
+        op_output.emit(annotated, "out")
+
+
 class FrameSinkOp(Operator):
-    """Holoscan sink op: shows frames with OpenCV so the graph ticks."""
     def setup(self, spec: OperatorSpec):
         spec.input("in")
 
     def start(self):
-        self.frame_count = 0
-        print("[FrameSinkOp] start", flush=True)
+        if not hasattr(self, "display_queue") or self.display_queue is None:
+            self.display_queue = queue.Queue(DISPLAY_Q_SIZE)
 
     def compute(self, op_input, op_output, context):
+        if STOP_EVENT.is_set():
+            raise SystemExit
         frame = op_input.receive("in")
         if frame is None:
             return
-        self.frame_count += 1
         try:
             self.display_queue.put_nowait(frame)
         except queue.Full:
@@ -60,48 +78,43 @@ def main():
     fragment = Fragment(app, "video_fragment")
     app.add_fragment(fragment)
 
-    allocator = UnboundedAllocator(fragment, name="allocator")
+    UnboundedAllocator(fragment, name="allocator")
 
     cam = OpenCVCaptureOp(fragment, name="opencv_camera")
     fragment.add_operator(cam)
 
+    yolo = YOLOPoseOp(fragment, name="yolo_pose")
+    fragment.add_operator(yolo)
+
     sink = FrameSinkOp(fragment, name="sink")
     fragment.add_operator(sink)
 
-    fragment.add_flow(cam, sink, {("frame", "in")})
+    fragment.add_flow(cam, yolo, {("frame", "in")})
+    fragment.add_flow(yolo, sink, {("out", "in")})
 
-    # Display infrastructure (main thread)
     dq = queue.Queue(DISPLAY_Q_SIZE)
-    sink.display_queue = dq  # inject queue
-
-    stop_flag = False
+    sink.display_queue = dq
 
     def display_loop():
-        print("[Display] loop start", flush=True)
-        last_ts = time.time()
-        while not stop_flag:
+        while not STOP_EVENT.is_set():
             try:
                 frame = dq.get(timeout=0.2)
             except queue.Empty:
                 continue
-            cv2.imshow("Holoscan /dev/video0", frame)
-            k = cv2.waitKey(1)
-            if k & 0xFF == ord('q'):
-                print("[Display] quit key", flush=True)
+            cv2.imshow("Holoscan YOLO Pose", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                STOP_EVENT.set()
                 break
-            
         cv2.destroyAllWindows()
-        print("[Display] loop exit", flush=True)
 
-    disp_thread = threading.Thread(target=display_loop, daemon=True)
-    disp_thread.start()
+    t = threading.Thread(target=display_loop, daemon=True)
+    t.start()
 
     try:
         app.run()
     finally:
-        stop_flag = True
-        disp_thread.join(timeout=2)
-        print("[Main] done", flush=True)
+        STOP_EVENT.set()
+        t.join(timeout=2)
 
 if __name__ == "__main__":
     main()
