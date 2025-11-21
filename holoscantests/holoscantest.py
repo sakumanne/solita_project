@@ -1,68 +1,107 @@
 from holoscan.core import Application, Fragment, Operator, OperatorSpec
-import numpy as np
-from pathlib import Path
-from ultralytics import YOLO
-from holoscan.operators import V4L2VideoCaptureOp, HolovizOp
+from holoscan.resources import UnboundedAllocator
+import cv2, threading, queue, time, os
 
+DISPLAY_Q_SIZE = 8
 
-class YOLOCameraOp(Operator):
-    """Operator, joka lukee kameran ja suorittaa YOLOv8-inferenssin sekä näyttää tulokset."""
-    def __init__(self, fragment, device="/dev/video0", weights_path=None, conf=0.25, *args, **kwargs):
-        super().__init__(fragment, *args, **kwargs)
-        self.device = device
-        self.weights_path = Path(weights_path) if weights_path else None
-        self.conf = conf
-        self.model = None
-        self.capture = None
-        self.frame_idx = 0
-        self.display = None  # Holoviz-operaattori
-
+class OpenCVCaptureOp(Operator):
+    """Holoscan source op: captures frames from /dev/video0 using OpenCV."""
     def setup(self, spec: OperatorSpec):
-        # Output-portti Holovizille
-        spec.output("video_out")
+        spec.output("frame")
 
     def start(self):
-        # Luo V4L2-video capture
-        self.capture = V4L2VideoCaptureOp(self.fragment, device=self.device, width=640, height=480)
-        if self.weights_path is None:
-            self.weights_path = Path(__file__).resolve().parent / "runs/weights_coco8/best.pt"
-        self.model = YOLO(str(self.weights_path))
-        print(f"[YOLOCameraOp] Model loaded from {self.weights_path}")
-        # Luo Holoviz display-operaattori
-        self.display = HolovizOp(self.fragment, name="display")
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not self.cap.isOpened():
+            raise RuntimeError("Webcam /dev/video0 not accessible.")
+        print("[OpenCVCaptureOp] opened /dev/video0", flush=True)
+        self.idx = 0
+
+    def stop(self):
+        if self.cap.isOpened():
+            self.cap.release()
+        print("[OpenCVCaptureOp] released", flush=True)
 
     def compute(self, op_input, op_output, context):
-        frame_msg = self.capture.read()
-        if frame_msg is None:
+        ok, frame = self.cap.read()
+        if not ok:
+            print("[OpenCVCaptureOp] read fail", flush=True)
             return
-
-        frame = np.asarray(frame_msg.get())
-        if frame.shape[2] == 3:
-            frame = frame[:, :, ::-1]  # RGB -> BGR
-
-        # YOLOv8 inference
-        results = self.model(frame, conf=self.conf, verbose=False)
-        annotated = results[0].plot()
-        annotated_rgb = annotated[:, :, ::-1]  # BGR -> RGB
-
-        self.frame_idx += 1
-
-        # Emittaa Holovizille suoraan
-        op_output.emit(annotated_rgb, "video_out")
+        self.idx += 1
+        if self.idx <= 5:
+            cv2.imwrite(f"/tmp/hs_cap_{self.idx}.png", frame)
+            print(f"[OpenCVCaptureOp] saved /tmp/hs_cap_{self.idx}.png", flush=True)
+        op_output.emit(frame, "frame")
 
 
-# ==========================================
-# Pipeline
-# ==========================================
-if __name__ == "__main__":
-    # Luo Holoscan-sovellus
+class FrameSinkOp(Operator):
+    """Holoscan sink op: shows frames with OpenCV so the graph ticks."""
+    def setup(self, spec: OperatorSpec):
+        spec.input("in")
+
+    def start(self):
+        self.frame_count = 0
+        print("[FrameSinkOp] start", flush=True)
+
+    def compute(self, op_input, op_output, context):
+        frame = op_input.receive("in")
+        if frame is None:
+            return
+        self.frame_count += 1
+        try:
+            self.display_queue.put_nowait(frame)
+        except queue.Full:
+            pass
+
+
+def main():
     app = Application()
     fragment = Fragment(app, "video_fragment")
     app.add_fragment(fragment)
 
-    # Luo YOLO + kamera operator
-    yolo_camera_op = YOLOCameraOp(fragment, device="/dev/video0", weights_path="runs/weights_coco8/best.pt")
-    fragment.add_operator(yolo_camera_op)  # Lisätään fragmenttiin
+    allocator = UnboundedAllocator(fragment, name="allocator")
 
-    # Käynnistä pipeline
-    app.run()
+    cam = OpenCVCaptureOp(fragment, name="opencv_camera")
+    fragment.add_operator(cam)
+
+    sink = FrameSinkOp(fragment, name="sink")
+    fragment.add_operator(sink)
+
+    fragment.add_flow(cam, sink, {("frame", "in")})
+
+    # Display infrastructure (main thread)
+    dq = queue.Queue(DISPLAY_Q_SIZE)
+    sink.display_queue = dq  # inject queue
+
+    stop_flag = False
+
+    def display_loop():
+        print("[Display] loop start", flush=True)
+        last_ts = time.time()
+        while not stop_flag:
+            try:
+                frame = dq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            cv2.imshow("Holoscan /dev/video0", frame)
+            k = cv2.waitKey(1)
+            if k & 0xFF == ord('q'):
+                print("[Display] quit key", flush=True)
+                break
+            
+        cv2.destroyAllWindows()
+        print("[Display] loop exit", flush=True)
+
+    disp_thread = threading.Thread(target=display_loop, daemon=True)
+    disp_thread.start()
+
+    try:
+        app.run()
+    finally:
+        stop_flag = True
+        disp_thread.join(timeout=2)
+        print("[Main] done", flush=True)
+
+if __name__ == "__main__":
+    main()
