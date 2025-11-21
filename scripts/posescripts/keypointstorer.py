@@ -77,7 +77,7 @@ class KeypointWriter:
             base = Path(__file__).resolve().parents[2]
             out_dir = base / "data"
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / "keypoints.jsonl"
+            out_path = out_dir / "video.jsonl"
         self.path = Path(out_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # open in append mode
