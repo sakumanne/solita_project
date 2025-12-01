@@ -1,0 +1,16 @@
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "cd poseapp && npm run dev",
+    "electron": "electron ./electron/main.js",
+    "start": "concurrently \"npm run dev\" \"npm run electron\""
+  },
+  "dependencies": {
+    "electron": "^39.2.1"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
