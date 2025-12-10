@@ -2,6 +2,8 @@ data/keypoints.jsonl
 __pycache__/
 *.py[cod]
 
+holoscantests/data/keypoints.jsonl
+
 # Virtual environments (ignore common names)
 .venv/
 venv/
