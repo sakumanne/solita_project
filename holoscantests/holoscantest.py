@@ -7,7 +7,7 @@ from holoscan.operators import V4L2VideoCaptureOp, HolovizOp
 
 class YOLOCameraOp(Operator):
     """Operator, joka lukee kameran ja suorittaa YOLOv8-inferenssin sekä näyttää tulokset."""
-    def __init__(self, fragment, device="/dev/video0", weights_path=None, conf=0.25, *args, **kwargs):
+    def __init__(self, fragment, device="/dev/video0", weights_path=None, conf=0.6, *args, **kwargs):
         super().__init__(fragment, *args, **kwargs)
         self.device = device
         self.weights_path = Path(weights_path) if weights_path else None
