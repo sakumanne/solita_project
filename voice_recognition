@@ -1,0 +1,34 @@
+import whisper
+from pyannote.audio import Pipeline
+import tempfile
+import os
+
+# Load Whisper model (use "base" or "small" for faster performance)
+whisper_model = whisper.load_model("small")
+
+# Load Pyannote speaker diarization pipeline
+# Requires a Hugging Face token for the pretrained diarization model
+# You can get one free from https://huggingface.co/pyannote/speaker-diarization
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
+                                    use_auth_token="YOUR_HF_TOKEN")
+
+audio_path = "conversation.wav"  # Path to your audio file
+
+# Run diarization (who spoke when)
+diarization = pipeline(audio_path)
+
+# Transcribe with Whisper
+result = whisper_model.transcribe(audio_path)
+
+# Combine diarization and transcription
+print("\n=== Transcription with Speakers ===\n")
+for segment in diarization.itertracks(yield_label=True):
+    start, end, speaker = segment
+    # Extract segment audio for Whisper
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        os.system(f"ffmpeg -loglevel error -y -i {audio_path} -ss {start.start:.2f} -to {end.end:.2f} -c copy {tmp.name}")
+        seg_result = whisper_model.transcribe(tmp.name)
+    print(f"[{speaker}] {seg_result['text']}")
+    os.remove(tmp.name)
+
+
