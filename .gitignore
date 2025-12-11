@@ -15,3 +15,6 @@ pyvenv.cfg
 venv/
 
 data/live_transcriptions.json
+
+
+yolov8x-pose.pt
