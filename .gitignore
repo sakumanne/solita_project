@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 
 holoscantests/data/keypoints.jsonl
+holoscantests/data/posture.jsonl
 
 # Virtual environments (ignore common names)
 .venv/
