@@ -119,5 +119,3 @@ class OpenCamera(Application):
                 op.add_dynamic_flow("signal", passthrough, "input")
 
         self.set_dynamic_flows(source, dynamic_flow_callback)
-
-

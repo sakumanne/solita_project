@@ -1,5 +1,6 @@
 import os
 from holoscantests.camera_yolo.camera import OpenCamera as oc
+#from scripts.WhisperOperator import WhisperOperator as wo
 
 
 def main():

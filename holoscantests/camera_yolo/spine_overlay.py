@@ -3,6 +3,7 @@ import numpy as np
 from ultralytics import YOLO
 import time
 import json
+from holoscantests.camera_yolo import spine_math
 
 # ---------------- CONFIG ----------------
 # Change this to your model path (e.g. Pose_ai.pt or best.pt)
@@ -130,6 +131,23 @@ def _draw_line(img, x0, y0, x1, y1, color, thickness=2):
         _draw_square(img, xi, yi, thickness, color)
 
 
+def _draw_text(img, text, x, y, color=(255, 0, 0), size=1):
+    """Draw simple text using squares (bitmap-style) since we don't have cv2."""
+    # Simple implementation: just draw a colored bar with indicator
+    # For actual text, you'd need a font renderer or cv2
+    # For now, draw a colored rectangle as warning indicator
+    h, w, _ = img.shape
+    bar_width = len(text) * 8 * size
+    bar_height = 12 * size
+    x0 = max(0, x - bar_width // 2)
+    x1 = min(w, x0 + bar_width)
+    y0 = max(0, y)
+    y1 = min(h, y + bar_height)
+
+    # Draw semi-transparent warning bar
+    img[y0:y1, x0:x1] = color
+
+
 # -------------- MAIN PUBLIC FUNCTION --------------
 
 def annotate_spine_rgb(rgb_frame):
@@ -145,8 +163,30 @@ def annotate_spine_rgb(rgb_frame):
     if not persons:
         return annotated
 
-    for idx, kpt_norm in enumerate(persons, start=1):
-        color = PERSON_COLORS[(idx - 1) % len(PERSON_COLORS)]
+    # First pass: analyze all people to get posture data
+    people_analysis = []
+    for idx, kpt_norm in enumerate(persons):
+        # Convert to absolute coords for analysis
+        abs_kp = []
+        for (xn, yn, conf) in kpt_norm:
+            abs_kp.append([float(xn * w), float(yn * h), float(conf)])
+
+        vsp_norm = _compute_virtual_spine(kpt_norm)
+        vsp_abs = []
+        if vsp_norm:
+            for (vx, vy, vc) in vsp_norm:
+                vsp_abs.append([float(vx * w), float(vy * h), float(vc)])
+
+        posture = spine_math.analyze_person_posture(abs_kp, vsp_abs) if vsp_abs else None
+        people_analysis.append((kpt_norm, vsp_norm, posture))
+
+    # Second pass: draw with colors based on posture
+    for idx, (kpt_norm, spine_pts, posture) in enumerate(people_analysis, start=1):
+        # Use RED if bad posture, otherwise normal color
+        if posture and posture.get("bad_posture", False):
+            color = (255, 0, 0)  # RED for bad posture
+        else:
+            color = PERSON_COLORS[(idx - 1) % len(PERSON_COLORS)]
 
         # Draw original YOLO keypoints
         for (xn, yn, conf) in kpt_norm:
@@ -155,23 +195,42 @@ def annotate_spine_rgb(rgb_frame):
             px, py = int(xn * w), int(yn * h)
             _draw_square(annotated, px, py, KEYPOINT_SIZE, color)
 
-        # Compute virtual spine
-        spine_pts = _compute_virtual_spine(kpt_norm)
         if len(spine_pts) != 4:
             continue
 
-        # Draw spine points and labels
+        # Draw spine points
         pix_points = []
         for (vx, vy, _) in spine_pts:
             px, py = int(vx * w), int(vy * h)
             pix_points.append((px, py))
             _draw_square(annotated, px, py, VIRTUAL_SIZE, color)
 
-        # Connect spine with lines (CERVICAL -> THORACIC -> LUMBAR -> SACRUM)
+        # Connect spine with lines - thicker red if bad posture
+        thickness = SPINE_THICKNESS * 2 if (posture and posture.get("bad_posture", False)) else SPINE_THICKNESS
         for i in range(len(pix_points) - 1):
             x0, y0 = pix_points[i]
             x1, y1 = pix_points[i + 1]
-            _draw_line(annotated, x0, y0, x1, y1, color, thickness=SPINE_THICKNESS)
+            _draw_line(annotated, x0, y0, x1, y1, color, thickness=thickness)
+
+        # Draw warning indicators if bad posture
+        if posture and posture.get("bad_posture", False):
+            warnings = posture.get("warnings", [])
+            nose_x, nose_y = int(kpt_norm[0][0] * w), int(kpt_norm[0][1] * h)
+
+            # Draw red warning square above head
+            _draw_square(annotated, nose_x, max(nose_y - 30, 10), 8, (255, 0, 0))
+
+            # Draw warning bars for each issue
+            warning_y = max(nose_y - 50, 20)
+            for i, warning in enumerate(warnings):
+                bar_y = warning_y - (i * 15)
+                if bar_y > 0:
+                    # Draw colored warning bar
+                    bar_len = 60
+                    bar_x = nose_x - bar_len // 2
+                    for x in range(max(0, bar_x), min(w, bar_x + bar_len)):
+                        for y in range(max(0, bar_y), min(h, bar_y + 10)):
+                            annotated[y, x] = (255, 100, 0)  # Orange warning bar
 
     # record all detected people (absolute coords) to data/keypoints.jsonl
     global _frame_counter
@@ -209,7 +268,7 @@ def _build_people_records_from_result(result, img_w: int, img_h: int):
       [{"id": 0, "keypoints": [[x,y,conf],...], "virtual_spine": [[x,y,conf],...]}, ...]
     Coordinates are absolute pixel coords (not normalized).
     """
-    persons_norm = _get_all_person_keypoints(result, img_w, img_h)  # returns normalized coords [nx,ny,conf]
+    persons_norm = _get_all_person_keypoints(result, img_w, img_h)
     if not persons_norm:
         return []
 
@@ -220,17 +279,21 @@ def _build_people_records_from_result(result, img_w: int, img_h: int):
         for (xn, yn, conf) in kpt_norm:
             abs_kp.append([float(xn * img_w), float(yn * img_h), float(conf)])
 
-        # compute virtual spine (normalized), convert to absolute if present
+        # compute virtual spine (normalized), convert to absolute
         vsp_norm = _compute_virtual_spine(kpt_norm)
         vsp_abs = []
         if vsp_norm:
             for (vx, vy, vc) in vsp_norm:
                 vsp_abs.append([float(vx * img_w), float(vy * img_h), float(vc)])
 
+        # ANALYZE POSTURE
+        posture = spine_math.analyze_person_posture(abs_kp, vsp_abs) if vsp_abs else None
+
         people.append({
             "id": int(pid),
             "keypoints": abs_kp,
             "virtual_spine": vsp_abs,
+            "posture": posture,  # NEW
         })
 
     return people
@@ -250,6 +313,35 @@ def _append_keypoints_record(frame_idx: int | None, people: list, filename: str 
     with open(out_path, "a", encoding="utf8") as f:
         f.write(json.dumps(rec) + "\n")
         f.flush()
+
+    # Also save posture data to separate file
+    _append_posture_record(frame_idx, people)
+
+def _append_posture_record(frame_idx: int | None, people: list):
+    """
+    Save only posture analysis to separate file: posture.jsonl
+    Format: {"ts": <float>, "frame": <int>, "postures": [{"id": 0, "posture": {...}}, ...]}
+    """
+    out_path = _get_project_data_path("posture.jsonl")
+    
+    # Extract ALL posture data (including good posture and None)
+    postures = []
+    for person in people:
+        postures.append({
+            "id": person["id"],
+            "posture": person.get("posture")  # Include even if None or good posture
+        })
+    
+    # Write if there are any people detected
+    if postures:
+        rec = {
+            "ts": time.time(),
+            "frame": int(frame_idx) if frame_idx is not None else None,
+            "postures": postures,
+        }
+        with open(out_path, "a", encoding="utf8") as f:
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
 
 
 
