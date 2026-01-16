@@ -9,9 +9,6 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.0",
-    "electron": "^39.2.4"
-  },
-  "dependencies": {
-    "react-split-pane": "^0.1.92"
+    "electron": "^39.2.6"
   }
 }
