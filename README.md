@@ -10,6 +10,9 @@ pip install whisper
 Instrctions:
 Pressing "q" terminates the webcam and the process.
 
+Run camera + audio together:
+python run_realtime.py
+
 
 
  -------------------- Front-end --------------------
