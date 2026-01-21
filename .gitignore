@@ -1,6 +1,11 @@
 data/keypoints.jsonl
 __pycache__/
 *.py[cod]
+*.pt
+
+holoscantests/data/keypoints.jsonl
+holoscantests/data/posture.jsonl
+holoscantests/data/live_transcriptions.json
 
 # Virtual environments (ignore common names)
 .venv/
@@ -12,9 +17,6 @@ venv.bak/
 pyvenv.cfg
 .Python
 # End virtualenv ignores
-venv/
-
-data/live_transcriptions.json
 
 
 yolov8x-pose.pt

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 
 type Severity = "ok" | "warn" | "critical";
 
@@ -46,22 +46,29 @@ export default function App() {
   const [currentSeverity, setCurrentSeverity] = useState<Severity>("ok");
   const [yoloEvents, setYoloEvents] = useState<YoloEvent[]>([]);
 
+  // Pysyvät ID-laskurit, etteivät nollaudu efektien uudelleenaloituksissa
+  const yoloIdRef = useRef<number>(1);
+  const whisperIdRef = useRef<number>(1);
+
   const [lastUtterance, setLastUtterance] = useState<string>(
     "(ei puhetta vielä)"
   );
+  // erotellaan tilat (status) ja varsinainen tapahtumataulukko
+  const [whisperStatus, setWhisperStatus] = useState<
+    "idle" | "connecting" | "receiving" | "error"
+  >("idle");
   const [whisperEvents, setWhisperEvents] = useState<WhisperEvent[]>([]);
 
   // YOLO-kuva backendistä
   const [yoloImage, setYoloImage] = useState<string | null>(null);
 
   // Paneelien leveys: YOLO-paneelin prosenttiosuus (Whisper = 100 - value)
-  const [layoutRatio, setLayoutRatio] = useState(55); // 55% YOLO / 45% Whisper
+  const [layoutRatio, setLayoutRatio] = useState(55); 
 
   // 🔹 YOLO: vastaanota dataa WebSocket-palvelimelta
   useEffect(() => {
     if (!isRunning) return;
 
-    let idCounter = 1;
     const ws = new WebSocket("ws://localhost:8765");
 
     ws.onopen = () => {
@@ -88,7 +95,7 @@ export default function App() {
 
         setYoloEvents((prev) => {
           const next: YoloEvent = {
-            id: idCounter++,
+            id: yoloIdRef.current++,
             timestamp,
             severity,
             angle: Math.round(angle),
@@ -119,56 +126,87 @@ export default function App() {
     };
   }, [isRunning]);
 
-  // 🔹 Whisper-mock: pyörii vain kun isRunning = true
+      // 🔹 Whisper: pollaa HTTP-APIa, joka lukee live_whisper.py:n JSON-tiedostoa
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isRunning) {
+      setWhisperStatus("idle");
+      return;
+    }
 
-    let id = 1;
-    const phrases: WhisperEvent["text"][] = [
-      "Ready",
-      "Auts, sattuu",
-      "Nosto ok",
-      "Voitko laskea minut hitaammin",
-      "Oho, ote lipsahti",
-      "Kaikki ok",
-    ];
+    setWhisperStatus("connecting");
 
-    const interval = setInterval(() => {
-      const ts = new Date().toLocaleTimeString("fi-FI", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
+    let lastTimestamp: string | null = null;
 
-      const text = phrases[Math.floor(Math.random() * phrases.length)];
-      let kind: WhisperEvent["kind"] = "info";
-      if (
-        text.toLowerCase().includes("sattuu") ||
-        text.toLowerCase().includes("auts")
-      ) {
-        kind = "pain";
-      } else if (text.toLowerCase().includes("ready")) {
-        kind = "command";
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch("http://localhost:8001/status");
+        if (!res.ok) {
+          setWhisperStatus("error");
+          return;
+        }
+
+        const data = await res.json();
+
+        if (!data.timestamp || data.timestamp === lastTimestamp) {
+          // saadaan vastauksia, mutta ei uutta tekstiä
+          // jos ei ole uutta tekstiä, merkitään yhteyden tilaksi vastaanotto
+          setWhisperStatus("receiving"); // yhteys ok, mutta hiljaista
+          return;
+        }
+        lastTimestamp = data.timestamp as string;
+
+        const text: string = data.transcript ?? "";
+        if (!text) {
+          // ei tekstiä, mutta yhteys toimii
+          setWhisperStatus("receiving");
+          return;
+        }
+
+        setWhisperStatus("receiving");
+
+        const tsDisplay = new Date().toLocaleTimeString("fi-FI", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+
+        const lower = text.toLowerCase();
+        let kind: WhisperEvent["kind"] = "info";
+        if (lower.includes("sattuu") || lower.includes("auts")) {
+          kind = "pain";
+        } else if (lower.includes("ready")) {
+          kind = "command";
+        }
+
+        setLastUtterance(text);
+        setWhisperEvents((prev) => {
+          const next: WhisperEvent = {
+            id: whisperIdRef.current++,
+            timestamp: tsDisplay,
+            text,
+            kind,
+          };
+          const merged = [next, ...prev];
+          return merged.slice(0, 100);
+        });
+      } catch (err) {
+        console.error("Whisper fetch failed", err);
+        setWhisperStatus("error");
       }
-
-      setLastUtterance(text);
-      setWhisperEvents((prev) => {
-        const next: WhisperEvent = { id: id++, timestamp: ts, text, kind };
-        const merged = [next, ...prev];
-        return merged.slice(0, 100);
-      });
-    }, 5000);
+    }, 1000); // 1s välein
 
     return () => clearInterval(interval);
   }, [isRunning]);
+
+
 
   const handleToggle = () => {
     setIsRunning((prev) => !prev);
   };
 
   const handleLayoutChange = (value: number) => {
-    // rajoitetaan väliin 35–65 %, ettei toinen paneeli katoa kokonaan
-    const clamped = Math.min(65, Math.max(35, value));
+    // rajoitetaan väliin 30–70 %, ettei toinen paneeli katoa kokonaan
+    const clamped = Math.min(70, Math.max(30, value));
     setLayoutRatio(clamped);
   };
 
@@ -210,14 +248,14 @@ export default function App() {
           Paneelien koko:
           <input
             type="range"
-            min={35}
-            max={65}
+            min={30}
+            max={70}
             value={layoutRatio}
             onChange={(e) => handleLayoutChange(Number(e.target.value))}
             className="w-40 accent-emerald-500"
           />
           <span className="tabular-nums text-slate-300">
-            {layoutRatio}% YOLO / {100 - layoutRatio}% Whisper
+            {layoutRatio}% Kamera / {100 - layoutRatio}% Whisper
           </span>
         </label>
       </div>
@@ -268,8 +306,7 @@ export default function App() {
             {/* YOLO-kuva backendistä */}
             <div className="rounded-2xl border border-slate-800 bg-slate-900/70 shadow-inner flex-1 flex flex-col min-h-[260px]">
               <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800 text-xs text-slate-400">
-                <span>YOLO-videovirta (backend → WebSocket)</span>
-                <span className="font-mono">annotated pose</span>
+                <span>Kamera</span>
               </div>
               <div className="flex-1 flex flex-col items-center justify-center p-4 gap-2">
                 <div className="aspect-video w-full border border-slate-700 rounded-xl overflow-hidden bg-black flex items-center justify-center">
@@ -285,10 +322,7 @@ export default function App() {
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-slate-500">
-                  Kuva piirretään Pythonissa (YOLOv8 + pose) ja lähetetään
-                  WebSocketin kautta.
-                </div>
+
               </div>
             </div>
           </section>

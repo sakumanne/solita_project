@@ -14,11 +14,7 @@ import sounddevice as sd
 import webrtcvad
 import whisper
 import torch
-
-
-# =========================================================
-# ASETUKSET
-# =========================================================
+from speechbrain.inference import EncoderClassifier
 
 SAMPLE_RATE = 16_000
 CHUNK_SECONDS = 0.5
