@@ -1,409 +1,456 @@
-"""Live Finnish speech-to-text helper using OpenAI Whisper + simple speaker separation.
-
-Tämä skripti:
-- Nauhoittaa mikistä (oletus: 5 sekunnin chunkit)
-- Transkriboi puheen suomeksi Whisper small -mallilla
-- Käyttää SpeechBrainin speaker-encoderia erottelemaan eri puhujat ilman tokeneita
-- Antaa puhujille tunnisteet SPEAKER_00, SPEAKER_01, SPEAKER_02, ...
-
-Huomioita:
-- Yhdellä chunkilla (esim. 5 s) on vain yksi puhuja-tunniste. Jos ihmiset puhuvat päällekkäin,
-  tämä ei jaa chunkkia kahtia, vaan antaa "dominantin" puhujan chunkille.
-- Tämä on "kevyt" online-klusterointi: kun uuden chunkin embedding ei muistuta mitään
-  aiempaa puhujaa tarpeeksi hyvin, luodaan uusi SPEAKER_X.
-
-Asennus:
-    pip install openai-whisper sounddevice soundfile numpy
-    pip install torch
-    pip install speechbrain
-"""
-
 from __future__ import annotations
 
-import argparse
-import json
 import math
+import os
 import queue
-import re
 import sys
-import time
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable, Optional, Union, List, Dict, Any
+import warnings
+from dataclasses import dataclass
+from typing import Any, List, Tuple, Optional
+from contextlib import contextmanager
 
 import numpy as np
 import sounddevice as sd
+import webrtcvad
 import whisper
-
 import torch
-from speechbrain.inference import EncoderClassifier
+
+
+# =========================================================
+# ASETUKSET
+# =========================================================
 
 SAMPLE_RATE = 16_000
-LOUD_DB_THRESHOLD = 70.0
-SILENCE_DB_THRESHOLD = -50.0
-DATA_DIR = Path(__file__).parent.parent / "data"
-LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
-SUPPORTED_LANGUAGES: tuple[str, ...] = ("fi",)
-DEFAULT_LANGUAGE = "fi"
-SUPPORTED_CHARACTERS = set(
-    "abcdefghijklmnopqrstuvwxyzåäö"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ"
-    "0123456789"
-    " .,;:!?\"'()[]{}-/\\@#$%&*+=<>"
+CHUNK_SECONDS = 0.5
+
+# VAD
+VAD_FRAME_MS = 20
+MIN_SPEECH_RATIO = 0.30
+MIN_SPEECH_SECONDS = 0.20
+SILENCE_DB_THRESHOLD = -55.0
+
+# Utterance loppuu, kun hiljaisuutta on näin monta chunkia
+END_SILENCE_CHUNKS = 3          # 3 * 0.5s = 1.5s
+UTTER_MAX_SECONDS = 15.0        # pidempi pätkä auttaa speaker-embeddingiä
+
+# Älä transkriboi liian lyhyitä pätkiä (roskaa / VAD false positive)
+MIN_UTTER_TO_TRANSCRIBE_SECONDS = 1.0
+
+# Speaker (TIUKENNETTU: jotta uudet puhujat syntyy helpommin)
+MAX_SPEAKERS = 10
+SPEAKER_SIM_THRESHOLD = 0.75    # ↑ oli 0.60 -> liian lepsu, kaikki menee helposti samaan puhujaan
+LAST_SPEAKER_BONUS = 0.00       # pois, ettei lukkiudu samaan puhujaan
+NEW_SPEAKER_STREAK = 1          # heti uusi puhuja jos sim alle kynnyksen
+MIN_UTTER_FOR_SPEAKER_SECONDS = 2.5  # liian lyhyistä pätkistä ei tehdä speaker-päätöstä
+
+# Whisper prompt (neutraali)
+DOMAIN_PROMPT = "Suomenkielinen puhe. Litteroi tarkasti."
+
+# Debug: jos haluat nähdä speaker-similariteetit
+DEBUG_SPEAKER = False
+
+
+# =========================================================
+# Hiljennä varoituksia
+# =========================================================
+warnings.filterwarnings("ignore")
+warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be .* leaked semaphore objects.*"
 )
 
-# Kuinka paljon historiaa syötetään initial_promptiin (merkkejä)
-MAX_HISTORY_CHARS = 500
 
-INITIAL_PROMPT = (
-    "Tämä on suomenkielinen keskustelu. Käytä suomen kieltä ja kirjakieltä."
-)
-
-AudioInput = Union[np.ndarray, str, Path]
+def status(msg: str) -> None:
+    print(f"STATUS: {msg}", flush=True)
 
 
-def is_supported_transcript(text: str) -> bool:
-    """Return True when the transcript only uses Finnish/English characters."""
-    return all((ch in SUPPORTED_CHARACTERS) or ch.isspace() for ch in text)
+@contextmanager
+def suppress_output(suppress_stdout: bool = True, suppress_stderr: bool = True):
+    devnull = open(os.devnull, "w")
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        if suppress_stdout:
+            sys.stdout = devnull
+        if suppress_stderr:
+            sys.stderr = devnull
+        yield
+    finally:
+        if suppress_stdout:
+            sys.stdout = old_out
+        if suppress_stderr:
+            sys.stderr = old_err
+        devnull.close()
 
 
-def rms_to_decibels(rms: float, reference: float = 1.0) -> float:
-    """Convert an RMS value to decibels relative to the reference amplitude."""
-    if rms <= 0.0:
-        return -math.inf
-    return 20.0 * math.log10(rms / reference)
+# =========================================================
+# APUTOIMINNOT
+# =========================================================
+
+def rms_db(x: np.ndarray) -> float:
+    if x.size == 0:
+        return -float("inf")
+    rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+    return 20.0 * math.log10(rms + 1e-9)
 
 
-def load_whisper_model(name: str) -> whisper.Whisper:
-    """Load a Whisper model, printing a helpful message the first time."""
-    print(f"Loading Whisper model '{name}'...", file=sys.stderr)
-    return whisper.load_model(name)
+def normalize_audio(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    x = x - float(np.mean(x))
+    peak = float(np.max(np.abs(x)) + 1e-9)
+    return (x / peak * 0.9).astype(np.float32)
 
 
-def load_speaker_encoder(device: str = "cpu") -> EncoderClassifier:
-    """Lataa SpeechBrainin speaker-encoderin (ei vaadi tokeneita)."""
-    print("Loading SpeechBrain speaker encoder (spkrec-ecapa-voxceleb)...", file=sys.stderr)
+def postprocess(text: str) -> str:
+    text = " ".join(text.strip().split())
+    if not text:
+        return ""
+    chars = list(text)
+    for i, c in enumerate(chars):
+        if c.isalpha():
+            chars[i] = c.upper()
+            break
+    return "".join(chars)
+
+
+# =========================================================
+# VAD
+# =========================================================
+
+vad = webrtcvad.Vad(1)
+
+
+def chunk_to_pcm16(chunk: np.ndarray) -> bytes:
+    return (np.clip(chunk, -1, 1) * 32768).astype(np.int16).tobytes()
+
+
+def vad_stats(pcm16: bytes) -> Tuple[float, float]:
+    frame_bytes = int(SAMPLE_RATE * VAD_FRAME_MS / 1000) * 2
+    total = 0
+    speech = 0
+    for i in range(0, len(pcm16) - frame_bytes + 1, frame_bytes):
+        if vad.is_speech(pcm16[i:i + frame_bytes], SAMPLE_RATE):
+            speech += 1
+        total += 1
+    if total == 0:
+        return 0.0, 0.0
+    return speech / total, speech * (VAD_FRAME_MS / 1000.0)
+
+
+def is_chunk_speech(chunk: np.ndarray) -> bool:
+    if rms_db(chunk) < SILENCE_DB_THRESHOLD:
+        return False
+    ratio, seconds = vad_stats(chunk_to_pcm16(chunk))
+    return ratio >= MIN_SPEECH_RATIO and seconds >= MIN_SPEECH_SECONDS
+
+
+# =========================================================
+# SPEAKER (ECAPA)
+# =========================================================
+
+@dataclass
+class SpeakerState:
+    encoder: Any
+    centroids: List[np.ndarray]
+    device: str = "cpu"
+    last_speaker: Optional[int] = None
+
+
+def load_speaker_encoder(device: str = "cpu") -> SpeakerState:
+    status("Ladataan speaker-encoder (ECAPA)...")
+    from speechbrain.inference import EncoderClassifier
+
     encoder = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         run_opts={"device": device},
+        savedir="pretrained_ecapa",
     )
-    return encoder
+    status("Speaker-encoder valmis.")
+    return SpeakerState(encoder=encoder, centroids=[], device=device)
 
 
-def postprocess_transcript(text: str) -> str:
-    """Lightweight cleanup of the transcript (whitespace, casing, etc.)."""
-    text = text.strip()
-    if not text:
-        return text
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text)
-
-    # Remove spaces before punctuation like " . , ! ? ; :"
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
-
-    # Capitalize first alphabetic character
-    first_alpha_idx: Optional[int] = None
-    for i, ch in enumerate(text):
-        if ch.isalpha():
-            first_alpha_idx = i
-            break
-    if first_alpha_idx is not None:
-        text = (
-            text[:first_alpha_idx]
-            + text[first_alpha_idx].upper()
-            + text[first_alpha_idx + 1 :]
-        )
-
-    return text
+def speaker_embedding(state: SpeakerState, audio: np.ndarray) -> np.ndarray:
+    wav = torch.from_numpy(audio).float().to(state.device).unsqueeze(0)
+    with torch.no_grad():
+        emb = state.encoder.encode_batch(wav).squeeze().cpu().numpy()
+    return emb.astype(np.float32)
 
 
-def transcribe_audio(
-    model: whisper.Whisper,
-    audio: AudioInput,
-    history: str = "",
-) -> str:
-    """Run Whisper on an audio buffer or file path and return the transcript."""
-    language = DEFAULT_LANGUAGE
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
-    if isinstance(audio, (np.ndarray, list, tuple)):
-        array = np.asarray(audio, dtype=np.float32)
-        if array.ndim > 1:
-            array = np.mean(array, axis=1)
-        audio_input: AudioInput = array
-    else:
-        audio_input = audio
 
-    # Käytä aiempaa historiaa initial_promptina, jos sitä on
-    if history:
-        prompt = history[-MAX_HISTORY_CHARS:]
-    else:
-        prompt = INITIAL_PROMPT
+def assign_speaker(state: SpeakerState, emb: np.ndarray) -> int:
+    # 1) ensimmäinen puhuja
+    if not state.centroids:
+        state.centroids.append(emb.copy())
+        state.last_speaker = 0
+        return 0
 
-    result = model.transcribe(
-        audio_input,
-        language=language,
-        fp16=False,
+    sims = [cosine_similarity(emb, c) for c in state.centroids]
+    best = int(np.argmax(sims))
+    best_sim = sims[best]
+
+    if DEBUG_SPEAKER:
+        sim_str = ", ".join(f"{i+1}:{s:.2f}" for i, s in enumerate(sims))
+        print(f"DEBUG speaker sims -> [{sim_str}] best={best+1} ({best_sim:.2f})")
+
+    # 2) jos riittävän samanlainen, päivitä centroidi
+    if best_sim >= SPEAKER_SIM_THRESHOLD:
+        state.centroids[best] = 0.9 * state.centroids[best] + 0.1 * emb
+        state.last_speaker = best
+        return best
+
+    # 3) muuten tee uusi puhuja (jos mahtuu)
+    if len(state.centroids) < MAX_SPEAKERS:
+        state.centroids.append(emb.copy())
+        state.last_speaker = len(state.centroids) - 1
+        return state.last_speaker
+
+    # 4) jos täynnä, pakota lähin
+    state.last_speaker = best
+    return best
+
+
+def speaker_label(i: int) -> str:
+    return f"SPEAKER_{i + 1}"
+
+
+# =========================================================
+# WHISPER
+# =========================================================
+
+def whisper_options() -> dict:
+    return dict(
+        language="fi",
         task="transcribe",
+        fp16=False,
+        initial_prompt=DOMAIN_PROMPT,
         temperature=0.0,
         beam_size=5,
         best_of=5,
-        initial_prompt=prompt,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.5,
+        verbose=False,
     )
-    transcript = result.get("text", "").strip()
-    transcript = postprocess_transcript(transcript)
-
-    return transcript if is_supported_transcript(transcript) else ""
 
 
-def record_chunks(duration: float) -> Iterable[np.ndarray]:
-    """Yield successive audio chunks recorded from the microphone."""
-    frames_per_chunk = int(duration * SAMPLE_RATE)
-    audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+BANNED_OUTPUTS = {
+    "Suomenkielinen puhe. Litteroi tarkasti.",
+    "Käytä selkeää yleiskieltä. Älä lisää mitään mitä ei sanota ääneen.",
+    "Älä lisää mitään mitä ei sanota ääneen.",
+}
 
-    def callback(indata, frames, time_info, status):  # type: ignore[override]
-        if status:
-            print(status, file=sys.stderr)
-        audio_queue.put(indata.copy())
+
+def transcribe_audio(model, audio: np.ndarray) -> str:
+    with suppress_output(suppress_stdout=True, suppress_stderr=True):
+        result = model.transcribe(audio, **whisper_options())
+    text = postprocess(result.get("text", ""))
+
+    if not text:
+        return ""
+    if text in BANNED_OUTPUTS:
+        return ""
+    if text.strip().lower() == DOMAIN_PROMPT.strip().lower():
+        return ""
+    return text
+
+
+def load_audio_any(path: str) -> np.ndarray:
+    status("Ladataan audio (ffmpeg)...")
+    try:
+        with suppress_output(suppress_stdout=True, suppress_stderr=True):
+            audio = whisper.audio.load_audio(path)  # float32, 16000 Hz
+        status(f"Audio ladattu ({len(audio)/SAMPLE_RATE:.1f} s)")
+        return audio.astype(np.float32)
+    except Exception as e:
+        print(f"ERROR: En saanut ladattua tiedostoa (tarvitset ffmpeg?): {e}")
+        return np.array([], dtype=np.float32)
+
+
+# =========================================================
+# LIVE
+# =========================================================
+
+def record_chunks(chunk_seconds: float):
+    frames = int(SAMPLE_RATE * chunk_seconds)
+    q: "queue.Queue[np.ndarray]" = queue.Queue()
+
+    def callback(indata, frames, time_info, status_):  # type: ignore[override]
+        q.put(indata.copy())
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",
-        blocksize=frames_per_chunk,
+        blocksize=frames,
         callback=callback,
     ):
-        try:
-            while True:
-                chunk = audio_queue.get()
-                yield chunk.reshape(-1)
-        except KeyboardInterrupt:
-            return
+        while True:
+            yield q.get().reshape(-1)
 
 
-def append_decibel_log_entry(log_file: Path, decibels: float, threshold: float) -> None:
-    """Append a JSON line containing the decibel estimate for the chunk."""
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "timestamp": time.time(),
-        "decibels": decibels if math.isfinite(decibels) else None,
-        "threshold": threshold,
-        "is_loud": decibels >= threshold if math.isfinite(decibels) else False,
-    }
-    with log_file.open("a", encoding="utf-8") as fh:
-        json.dump(entry, fh, ensure_ascii=False)
-        fh.write("\n")
+def _flush_and_print(model, speaker_state: SpeakerState, buf: List[np.ndarray]) -> None:
+    if not buf:
+        return
 
+    utter = normalize_audio(np.concatenate(buf))
+    utter_seconds = len(utter) / SAMPLE_RATE
 
-def _ensure_data_dir() -> None:
-    """Create data directory if missing."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Skip liian lyhyet pätkät kokonaan
+    if utter_seconds < MIN_UTTER_TO_TRANSCRIBE_SECONDS:
+        return
 
-
-def _write_status(timestamp: str, transcript: str, db: float, loud: bool) -> None:
-    """Write latest status JSON for monitor to read."""
-    _ensure_data_dir()
-    status = {
-        "timestamp": timestamp,
-        "transcript": transcript or "",
-        "decibels": None if db == float("-inf") else round(float(db), 2),
-        "loud": bool(loud),
-    }
-    with open(LATEST_JSON, "w", encoding="utf-8") as f:
-        json.dump(status, f, ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------
-# Speaker embedding & online-klusterointi
-# ---------------------------------------------------------------------
-
-
-def get_speaker_embedding(
-    encoder: EncoderClassifier,
-    audio_chunk: np.ndarray,
-    device: str = "cpu",
-) -> np.ndarray:
-    """Laske speaker-embedding yhdelle audiochunkille (mono float32)."""
-    # SpeechBrain odottaa tensorin muodossa [batch, time]
-    wav = torch.from_numpy(audio_chunk).float().to(device).unsqueeze(0)
-    with torch.no_grad():
-        emb = encoder.encode_batch(wav)  # shape [1, 1, D] tai [1, D]
-    emb = emb.squeeze().cpu().numpy().astype(np.float32)
-    return emb
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity kahden vektorin välillä."""
-    a_norm = np.linalg.norm(a)
-    b_norm = np.linalg.norm(b)
-    if a_norm == 0 or b_norm == 0:
-        return 0.0
-    return float(np.dot(a, b) / (a_norm * b_norm))
-
-
-def assign_speaker(
-    emb: np.ndarray,
-    speaker_centroids: List[np.ndarray],
-    similarity_threshold: float = 0.65,
-) -> int:
-    """Päätä mihin puhujaan embedding kuuluu, tai luo uusi puhuja.
-
-    - speaker_centroids: lista puhujien "keskivektoreita"
-    - palauttaa speaker_id (0, 1, 2, ...)
-    - jos mikään centroidi ei ole riittävän lähellä, luodaan uusi puhuja
-    """
-    if not speaker_centroids:
-        speaker_centroids.append(emb.copy())
-        return 0
-
-    sims = [cosine_similarity(emb, c) for c in speaker_centroids]
-    best_id = int(np.argmax(sims))
-    best_sim = sims[best_id]
-
-    if best_sim >= similarity_threshold:
-        # Päivitä centroidia vähän uusilla havainnoilla (liukuva keskiarvo)
-        speaker_centroids[best_id] = 0.8 * speaker_centroids[best_id] + 0.2 * emb
-        return best_id
+    # Speaker päätös: tee vain jos pätkä on tarpeeksi pitkä
+    if utter_seconds >= MIN_UTTER_FOR_SPEAKER_SECONDS:
+        emb = speaker_embedding(speaker_state, utter)
+        spk = assign_speaker(speaker_state, emb)
     else:
-        speaker_centroids.append(emb.copy())
-        return len(speaker_centroids) - 1
+        # liian lyhyt pätkä -> käytä viimeisintä puhujaa (tai 0)
+        spk = speaker_state.last_speaker if speaker_state.last_speaker is not None else 0
+
+    text = transcribe_audio(model, utter)
+    if text:
+        print(f"{speaker_label(spk)}: {text}")
 
 
-def speaker_label_from_id(speaker_id: int) -> str:
-    """Muuta integer-id luettavaan muotoon."""
-    return f"SPEAKER_{speaker_id:02d}"
+def live_transcription(model_name: str, device: str = "cpu") -> None:
+    status(f"Ladataan Whisper-malli ({model_name})...")
+    model = whisper.load_model(model_name)
+    status("Whisper-malli valmis.")
+    speaker_state = load_speaker_encoder(device=device)
 
+    buf: List[np.ndarray] = []
+    buf_len = 0.0
+    silence = 0
 
-# ---------------------------------------------------------------------
-# Päälooppi
-# ---------------------------------------------------------------------
-
-
-def live_transcription(
-    model_name: str,
-    chunk_duration: float,
-    decibel_log: Path,
-    device: str = "cpu",
-) -> None:
-    """Continuously record microphone audio, monitor sound levels and separate speakers."""
-    print(
-        "Press Ctrl+C to stop. Monitoring sound levels, separating speakers and transcribing speech...\n",
-        file=sys.stderr,
-    )
-    whisper_model = load_whisper_model(model_name)
-    speaker_encoder = load_speaker_encoder(device=device)
-
-    print(f"Recording in {int(chunk_duration)}-second chunks...", file=sys.stderr)
-
-    history = ""  # Whisperin tekstihistoria initial_promptia varten
-
-    # Speaker-klusteroinnin tila
-    speaker_centroids: List[np.ndarray] = []
-
-    # Aika
-    recording_start_time = time.time()
-    chunk_index = 0
+    print("\nLIVE (Ctrl+C lopettaa)\n")
 
     try:
-        for audio_chunk in record_chunks(chunk_duration):
-            if not audio_chunk.size:
-                continue
-
-            # Chunkin aika-arvio
-            chunk_start_time = recording_start_time + chunk_index * chunk_duration
-            chunk_end_time = chunk_start_time + chunk_duration
-            chunk_index += 1
-
-            # Laske dB
-            rms = float(np.sqrt(np.mean(audio_chunk.astype(np.float64) ** 2)))
-            if rms <= 0.0:
-                db = float("-inf")
+        for chunk in record_chunks(CHUNK_SECONDS):
+            if is_chunk_speech(chunk):
+                buf.append(chunk)
+                buf_len += CHUNK_SECONDS
+                silence = 0
             else:
-                db = 20.0 * math.log10(rms)
+                silence += 1
 
-            # Logita dB
-            append_decibel_log_entry(decibel_log, db, LOUD_DB_THRESHOLD)
+            end_by_silence = bool(buf) and silence >= END_SILENCE_CHUNKS
+            end_by_maxlen = buf_len >= UTTER_MAX_SECONDS
 
-            # Hiljaiset chunkit → ei transkriptiota
-            if (not math.isfinite(db)) or db < SILENCE_DB_THRESHOLD:
-                transcript = ""
-                loud = False
-                speaker_id = None
-            else:
-                loud = db >= LOUD_DB_THRESHOLD
-
-                # Whisper-transkriptio
-                transcript = transcribe_audio(
-                    whisper_model, audio_chunk, history=history
-                )
-
-                # Speaker-embedding ja -id, jos on tekstiä
-                if transcript:
-                    emb = get_speaker_embedding(speaker_encoder, audio_chunk, device)
-                    speaker_id = assign_speaker(emb, speaker_centroids)
-                else:
-                    speaker_id = None
-
-            # Päivitä historia
-            if transcript:
-                if history:
-                    history = (history + " " + transcript).strip()
-                else:
-                    history = transcript
-
-                if len(history) > MAX_HISTORY_CHARS:
-                    history = history[-MAX_HISTORY_CHARS:]
-
-            # Kirjoita status JSON
-            timestamp = datetime.utcnow().isoformat() + "Z"
-            _write_status(timestamp, transcript, db, loud)
-
-            # Tulostus
-            if transcript:
-                if speaker_id is not None:
-                    speaker_label = speaker_label_from_id(speaker_id)
-                    print(f"{speaker_label}: {transcript}")
-                else:
-                    print(transcript)
-
-            if loud:
-                print(f"WARNING: Loud noise detected ({db:.1f} dB)!", file=sys.stderr)
+            if end_by_silence or end_by_maxlen:
+                _flush_and_print(model, speaker_state, buf)
+                buf = []
+                buf_len = 0.0
+                silence = 0
 
     except KeyboardInterrupt:
-        print("\nStopped monitoring and transcription.", file=sys.stderr)
+        _flush_and_print(model, speaker_state, buf)
+        print("\nLopetettu.")
 
 
-def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model",
-        default="small",
-        help="Whisper model size to use (tiny, base, small, medium, large).",
-    )
-    parser.add_argument(
-        "--chunk-duration",
-        type=float,
-        default=5.0,
-        help="Number of seconds per live recording chunk (default: 5).",
-    )
-    parser.add_argument(
-        "--decibel-log",
-        type=Path,
-        default=Path("decibel_log.jsonl"),
-        help="Path to append JSON loudness samples (default: decibel_log.jsonl).",
-    )
-    parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Torch device to use for models (default: cpu, e.g. cuda if GPU available).",
-    )
+# =========================================================
+# FILE
+# =========================================================
 
-    return parser.parse_args(list(argv) if argv is not None else None)
+def transcribe_file_with_speakers(model_name: str, device: str = "cpu") -> None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        status("tkinter puuttuu. Anna tiedostopolku komentoriviltä.")
+        path = input("Tiedostopolku: ").strip()
+    else:
+        with suppress_output(suppress_stdout=True, suppress_stderr=True):
+            root = tk.Tk()
+            root.withdraw()
+            path = filedialog.askopenfilename()
+            root.destroy()
+
+    if not path:
+        return
+
+    status(f"Tiedosto valittu: {path}")
+    audio = load_audio_any(path)
+    if audio.size == 0:
+        return
+
+    status(f"Ladataan Whisper-malli ({model_name})...")
+    model = whisper.load_model(model_name)
+    status("Whisper-malli valmis.")
+
+    speaker_state = load_speaker_encoder(device=device)
+
+    chunk_len = int(SAMPLE_RATE * CHUNK_SECONDS)
+    buf: List[np.ndarray] = []
+    buf_len = 0.0
+    silence = 0
+
+    print("\nFILE\n")
+
+    for i in range(0, len(audio), chunk_len):
+        chunk = audio[i:i + chunk_len]
+
+        # Pad viimeinen vajaa chunk
+        if chunk.shape[0] < chunk_len:
+            chunk = np.pad(chunk, (0, chunk_len - chunk.shape[0]))
+
+        if is_chunk_speech(chunk):
+            buf.append(chunk)
+            buf_len += CHUNK_SECONDS
+            silence = 0
+        else:
+            silence += 1
+
+        end_by_silence = bool(buf) and silence >= END_SILENCE_CHUNKS
+        end_by_maxlen = buf_len >= UTTER_MAX_SECONDS
+
+        if end_by_silence or end_by_maxlen:
+            _flush_and_print(model, speaker_state, buf)
+            buf = []
+            buf_len = 0.0
+            silence = 0
+
+    # FINAL FLUSH
+    _flush_and_print(model, speaker_state, buf)
 
 
-def main(argv: Optional[Iterable[str]] = None) -> None:
-    args = parse_args(argv)
-    live_transcription(args.model, args.chunk_duration, args.decibel_log, device=args.device)
+# =========================================================
+# CLI
+# =========================================================
+
+def choose_mode() -> str:
+    while True:
+        print("Valitse tila:")
+        print("1) Live mikrofoni")
+        print("2) Tiedostosta")
+        choice = input("Valinta (1/2): ").strip()
+        if choice in ("1", "2"):
+            return choice
+        print("Anna 1 tai 2.\n")
+
+
+def choose_model() -> str:
+    mapping = {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "large"}
+    print("Valitse Whisper-malli:")
+    print("1) tiny")
+    print("2) base")
+    print("3) small")
+    print("4) medium")
+    print("5) large")
+    choice = input("Valinta (ENTER = small): ").strip()
+    if not choice:
+        return "small"
+    return mapping.get(choice, "small")
+
+
+def main():
+    mode = choose_mode()
+    model_name = choose_model()
+
+    if mode == "2":
+        transcribe_file_with_speakers(model_name=model_name, device="cpu")
+    else:
+        live_transcription(model_name=model_name, device="cpu")
 
 
 if __name__ == "__main__":
