@@ -36,7 +36,7 @@ import sounddevice as sd
 import whisper
 
 import torch
-from speechbrain.pretrained import EncoderClassifier
+from speechbrain.inference import EncoderClassifier
 
 SAMPLE_RATE = 16_000
 LOUD_DB_THRESHOLD = 70.0
