@@ -23,6 +23,7 @@ function severityLabel(sev: Severity) {
       return "Ergonomia OK";
     case "warn":
       return "Pyöristyvä selkä";
+              </div>
     case "critical":
       return "Väärä asento – keskeytä!";
   }
@@ -51,6 +52,7 @@ export default function App() {
 
   // MOCK: YOLO-data, pyörii vain kun isRunning = true
   useEffect(() => {
+              </div>
     if (!isRunning) return;
 
     let id = 1;
@@ -89,6 +91,7 @@ export default function App() {
   useEffect(() => {
     if (!isRunning) return;
 
+              </div>
     let id = 1;
     const phrases: WhisperEvent["text"][] = [
       "Ready",
@@ -118,6 +121,7 @@ export default function App() {
       setWhisperEvents((prev) => {
         const next: WhisperEvent = { id: id++, timestamp: ts, text, kind };
         const merged = [next, ...prev];
+              </div>
         // Täysi transkriptio – max 100 viimeistä repliikkiä
         return merged.slice(0, 100);
       });
