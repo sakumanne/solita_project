@@ -5,6 +5,7 @@ __pycache__/
 
 holoscantests/data/keypoints.jsonl
 holoscantests/data/posture.jsonl
+holoscantests/data/live_transcriptions.json
 
 # Virtual environments (ignore common names)
 .venv/
@@ -16,5 +17,3 @@ venv.bak/
 pyvenv.cfg
 .Python
 # End virtualenv ignores
-
-data/live_transcriptions.json
