@@ -190,7 +190,7 @@ with open(output_csv, mode="w", newline="") as file:
         h, w = image.shape[:2]
 
         # run YOLO pose inference
-        results = model(image, conf=0.6, iou=0.4)  # returns a Results object list; supports numpy image directly
+        results = model(image, conf=0.7, iou=0.4)  # returns a Results object list; supports numpy image directly
         if len(results) == 0:
             print(f"No results from YOLO for {filename}")
             continue
