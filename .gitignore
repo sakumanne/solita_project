@@ -5,7 +5,7 @@ __pycache__/
 
 holoscantests/data/keypoints.jsonl
 holoscantests/data/posture.jsonl
-holoscantests/data/live_transcriptions.json
+holoscantests/data/live_transcript_latest.json
 holoscantests/data/decibel_log.jsonl
 
 # Virtual environments (ignore common names)
