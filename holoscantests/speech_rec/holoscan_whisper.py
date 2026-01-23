@@ -21,39 +21,59 @@ import whisper
 from holoscan.core import Operator, OperatorSpec
 from speechbrain.inference import EncoderClassifier
 
-# Audio configuration
+
+# =========================================================
+# ASETUKSET
+# =========================================================
+
 SAMPLE_RATE = 16_000
 CHUNK_SECONDS = 0.5
 
 # VAD
 VAD_FRAME_MS = 20
-MIN_SPEECH_RATIO = 0.10  # was 0.30 - make it easier
-MIN_SPEECH_SECONDS = 0.10  # was 0.20 - lower threshold
-SILENCE_DB_THRESHOLD = -65.0  # was -55.0 - more sensitive
+MIN_SPEECH_RATIO = 0.30
+MIN_SPEECH_SECONDS = 0.20
+SILENCE_DB_THRESHOLD = -55.0
 
 # Utterance loppuu, kun hiljaisuutta on näin monta chunkia
-END_SILENCE_CHUNKS = 3
-UTTER_MAX_SECONDS = 15.0
+END_SILENCE_CHUNKS = 3          # 3 * 0.5s = 1.5s
+UTTER_MAX_SECONDS = 15.0        # pidempi pätkä auttaa speaker-embeddingiä
+
+# Älä transkriboi liian lyhyitä pätkiä (roskaa / VAD false positive)
 MIN_UTTER_TO_TRANSCRIBE_SECONDS = 1.0
 
-# Speaker
+# Speaker (TIUKENNETTU: jotta uudet puhujat syntyy helpommin)
 MAX_SPEAKERS = 10
 SPEAKER_SIM_THRESHOLD = 0.75
 LAST_SPEAKER_BONUS = 0.00
 NEW_SPEAKER_STREAK = 1
 MIN_UTTER_FOR_SPEAKER_SECONDS = 2.5
 
-# Whisper
+# Whisper prompt
 DOMAIN_PROMPT = "Suomenkielinen puhe. Litteroi tarkasti."
 
+# Data paths
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
+TRANSCRIPT_JSONL = DATA_DIR / "live_transcript.jsonl"
 
+# Debug
 DEBUG_SPEAKER = False
 
-# Silence warnings
-warnings.filterwarnings("ignore")
 
+# =========================================================
+# Suppress warnings
+# =========================================================
+warnings.filterwarnings("ignore")
+warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be .* leaked semaphore objects.*"
+)
+
+
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
 
 @contextmanager
 def suppress_output(suppress_stdout: bool = True, suppress_stderr: bool = True):
@@ -74,6 +94,7 @@ def suppress_output(suppress_stdout: bool = True, suppress_stderr: bool = True):
 
 
 def rms_db(x: np.ndarray) -> float:
+    """Calculate RMS in decibels."""
     if x.size == 0:
         return -float("inf")
     rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
@@ -81,6 +102,7 @@ def rms_db(x: np.ndarray) -> float:
 
 
 def normalize_audio(x: np.ndarray) -> np.ndarray:
+    """Normalize audio to float32."""
     x = x.astype(np.float32)
     x = x - float(np.mean(x))
     peak = float(np.max(np.abs(x)) + 1e-9)
@@ -88,6 +110,7 @@ def normalize_audio(x: np.ndarray) -> np.ndarray:
 
 
 def postprocess(text: str) -> str:
+    """Post-process transcribed text."""
     text = " ".join(text.strip().split())
     if not text:
         return ""
@@ -99,15 +122,24 @@ def postprocess(text: str) -> str:
     return "".join(chars)
 
 
-# VAD
+def status(msg: str) -> None:
+    print(f"STATUS: {msg}", flush=True)
+
+
+# =========================================================
+# VAD (Voice Activity Detection)
+# =========================================================
+
 vad = webrtcvad.Vad(1)
 
 
 def chunk_to_pcm16(chunk: np.ndarray) -> bytes:
+    """Convert float audio chunk to PCM16."""
     return (np.clip(chunk, -1, 1) * 32768).astype(np.int16).tobytes()
 
 
 def vad_stats(pcm16: bytes) -> Tuple[float, float]:
+    """Calculate speech ratio and duration from PCM16 bytes."""
     frame_bytes = int(SAMPLE_RATE * VAD_FRAME_MS / 1000) * 2
     total = 0
     speech = 0
@@ -121,19 +153,24 @@ def vad_stats(pcm16: bytes) -> Tuple[float, float]:
 
 
 def is_chunk_speech(chunk: np.ndarray) -> bool:
+    """Detect if chunk contains speech."""
     if rms_db(chunk) < SILENCE_DB_THRESHOLD:
         return False
     ratio, seconds = vad_stats(chunk_to_pcm16(chunk))
     return ratio >= MIN_SPEECH_RATIO and seconds >= MIN_SPEECH_SECONDS
 
 
+# =========================================================
+# HOLOSCAN OPERATORS
+# =========================================================
+
 class AudioCaptureOp(Operator):
-    """Captures audio from microphone and emits chunks with VAD detection."""
+    """Captures audio from microphone and emits chunks."""
 
     def __init__(self, *args, chunk_duration: float = CHUNK_SECONDS, **kwargs):
         super().__init__(*args, **kwargs)
         self.chunk_duration = chunk_duration
-        self.audio_queue = queue.Queue()
+        self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self.stream = None
 
     def setup(self, spec: OperatorSpec):
@@ -143,9 +180,9 @@ class AudioCaptureOp(Operator):
         """Start audio stream."""
         frames_per_chunk = int(self.chunk_duration * SAMPLE_RATE)
 
-        def callback(indata, frames, time_info, status):
-            if status:
-                print(f"Audio status: {status}")
+        def callback(indata, frames, time_info, status_):
+            if status_:
+                print(f"Audio status: {status_}", flush=True)
             self.audio_queue.put(indata.copy())
 
         self.stream = sd.InputStream(
@@ -156,7 +193,7 @@ class AudioCaptureOp(Operator):
             callback=callback,
         )
         self.stream.start()
-        print(f"Audio capture started: {SAMPLE_RATE}Hz, {self.chunk_duration}s chunks")
+        status(f"Audio capture started: {SAMPLE_RATE}Hz, {self.chunk_duration}s chunks")
 
     def compute(self, op_input, op_output, context):
         """Get audio chunk from queue and emit."""
@@ -172,7 +209,7 @@ class AudioCaptureOp(Operator):
         if self.stream:
             self.stream.stop()
             self.stream.close()
-            print("Audio capture stopped")
+            status("Audio capture stopped")
 
 
 class WhisperTranscribeOp(Operator):
@@ -200,19 +237,21 @@ class WhisperTranscribeOp(Operator):
 
     def setup(self, spec: OperatorSpec):
         spec.input("audio_in")
-        spec.output("done")  # Add this
+        spec.output("done")
 
     def start(self):
         """Load models."""
-        print(f"Loading Whisper model '{self.model_name}'...")
+        status(f"Loading Whisper model '{self.model_name}'...")
         self.whisper_model = whisper.load_model(self.model_name)
 
-        print("Loading SpeechBrain speaker encoder...")
+        status("Loading SpeechBrain speaker encoder (ECAPA)...")
         self.speaker_encoder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             run_opts={"device": self.device},
+            savedir="pretrained_ecapa",
         )
-        print("Models loaded successfully")
+        status("Models loaded successfully")
+        print("\nLIVE (Ctrl+C lopettaa)\n", flush=True)
 
     def compute(self, op_input, op_output, context):
         """Process audio chunk with VAD."""
@@ -220,10 +259,8 @@ class WhisperTranscribeOp(Operator):
         if chunk is None or chunk.size == 0:
             return
 
-        # DEBUG
-        db = rms_db(chunk)
+        # Check if chunk contains speech
         is_speech = is_chunk_speech(chunk)
-        print(f"[DEBUG] chunk: db={db:.1f}, is_speech={is_speech}, buf_len={self.buf_len:.1f}s, silence={self.silence}")
 
         # VAD detection
         if is_speech:
@@ -238,7 +275,6 @@ class WhisperTranscribeOp(Operator):
         end_by_maxlen = self.buf_len >= UTTER_MAX_SECONDS
 
         if end_by_silence or end_by_maxlen:
-            print(f"[DEBUG] FLUSHING: end_by_silence={end_by_silence}, end_by_maxlen={end_by_maxlen}")
             self._flush_and_process()
             op_output.emit(True, "done")
 
@@ -269,81 +305,136 @@ class WhisperTranscribeOp(Operator):
 
         # Write status and print
         self._write_status(text, spk)
+        self._write_transcript_jsonl(text, spk, utter_seconds)
         if text:
             speaker_label = f"SPEAKER_{spk + 1}"
-            print(f"{speaker_label}: {text}")
+            print(f"{speaker_label}: {text}", flush=True)
 
+        # Reset buffer
         self.buf = []
         self.buf_len = 0.0
         self.silence = 0
 
     def _transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe audio."""
-        with suppress_output(suppress_stdout=True, suppress_stderr=True):
-            result = self.whisper_model.transcribe(
-                audio,
-                language="fi",
-                task="transcribe",
-                fp16=False,
-                initial_prompt=DOMAIN_PROMPT,
-                temperature=0.0,
-                beam_size=5,
-                best_of=5,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.5,
-                verbose=False,
-            )
-        return postprocess(result.get("text", ""))
+        """Transcribe audio using Whisper."""
+        try:
+            with suppress_output(suppress_stdout=True, suppress_stderr=True):
+                result = self.whisper_model.transcribe(
+                    audio,
+                    language="fi",
+                    task="transcribe",
+                    fp16=False,
+                    initial_prompt=DOMAIN_PROMPT,
+                    temperature=0.0,
+                    beam_size=5,
+                    best_of=5,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.5,
+                    verbose=False,
+                )
+            text = postprocess(result.get("text", ""))
+            
+            # Reject banned outputs
+            BANNED_OUTPUTS = {
+                "Suomenkielinen puhe. Litteroi tarkasti.",
+                "Käytä selkeää yleiskieltä. Älä lisää mitään mitä ei sanota ääneen.",
+                "Älä lisää mitään mitä ei sanota ääneen.",
+                "Kiitos.",
+                "Kiitos",
+                "Kiitos kun katsoit videon!",
+                "Kiitos kun katsoit videon",
+                "Kiitos kun katsoit",
+                "Tervetuloa.",
+                "Tervetuloa",
+                "Käytä yleiskieltä.",
+                "Litteroi tarkasti.",
+                "Litteroi tarkasti",
+            }
+            
+            if not text:
+                return ""
+            if text in BANNED_OUTPUTS:
+                return ""
+            if text.strip().lower() == DOMAIN_PROMPT.strip().lower():
+                return ""
+            
+            return text
+        except Exception as e:
+            print(f"[TRANSCRIBE ERROR] {e}", flush=True)
+            return ""
 
     def _get_speaker_embedding(self, audio: np.ndarray) -> np.ndarray:
-        """Calculate speaker embedding."""
-        wav = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
-        with torch.no_grad():
-            emb = self.speaker_encoder.encode_batch(wav)
-        return emb.squeeze().cpu().numpy().astype(np.float32)
+        """Calculate speaker embedding using ECAPA."""
+        try:
+            wav = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                emb = self.speaker_encoder.encode_batch(wav)
+            return emb.squeeze().cpu().numpy().astype(np.float32)
+        except Exception as e:
+            print(f"[EMBEDDING ERROR] {e}", flush=True)
+            return np.zeros(192, dtype=np.float32)
 
     def _assign_speaker(self, emb: np.ndarray, threshold: float = SPEAKER_SIM_THRESHOLD) -> int:
         """Assign speaker ID based on embedding similarity."""
+        # First speaker
         if not self.speaker_centroids:
             self.speaker_centroids.append(emb.copy())
             self.last_speaker = 0
             return 0
 
+        # Compare with existing speakers
         sims = [self._cosine_similarity(emb, c) for c in self.speaker_centroids]
         best = int(np.argmax(sims))
         best_sim = sims[best]
 
         if DEBUG_SPEAKER:
             sim_str = ", ".join(f"{i+1}:{s:.2f}" for i, s in enumerate(sims))
-            print(f"DEBUG speaker sims -> [{sim_str}] best={best+1} ({best_sim:.2f})")
+            print(f"DEBUG speaker sims -> [{sim_str}] best={best+1} ({best_sim:.2f})", flush=True)
 
+        # If similar enough to existing speaker, update centroid
         if best_sim >= threshold:
             self.speaker_centroids[best] = 0.9 * self.speaker_centroids[best] + 0.1 * emb
             self.last_speaker = best
             return best
 
+        # Create new speaker if not at max
         if len(self.speaker_centroids) < MAX_SPEAKERS:
             self.speaker_centroids.append(emb.copy())
             self.last_speaker = len(self.speaker_centroids) - 1
             return self.last_speaker
 
+        # Force to best if at max
         self.last_speaker = best
         return best
 
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Calculate cosine similarity."""
+        """Calculate cosine similarity between embeddings."""
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
     @staticmethod
     def _write_status(transcript: str, speaker_id: int) -> None:
-        """Write status to JSON file."""
+        """Write latest transcript to JSON file."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        status = {
+        status_data = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "transcript": transcript or "",
+            "speaker": f"SPEAKER_{speaker_id + 1}",
             "decibels": None,
             "loud": False,
         }
         with open(LATEST_JSON, "w", encoding="utf-8") as f:
-            json.dump(status, f, ensure_ascii=False, indent=2)
+            json.dump(status_data, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _write_transcript_jsonl(transcript: str, speaker_id: int, duration: float) -> None:
+        """Append transcript to JSONL file."""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "transcript": transcript or "",
+            "speaker": f"SPEAKER_{speaker_id + 1}",
+            "duration_seconds": round(duration, 2),
+        }
+        with open(TRANSCRIPT_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")

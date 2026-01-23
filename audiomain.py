@@ -1,4 +1,4 @@
-# holomain_audio.py
+# Testi main whisperin testaamiseen erikseen
 from holoscantests.speech_rec.audio_app import AudioTranscriptionApp
 
 def main():
