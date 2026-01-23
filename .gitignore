@@ -7,6 +7,7 @@ holoscantests/data/keypoints.jsonl
 holoscantests/data/posture.jsonl
 holoscantests/data/live_transcript_latest.json
 holoscantests/data/decibel_log.jsonl
+holoscantests/data/live_transcript.jsonl
 
 # Virtual environments (ignore common names)
 .venv/

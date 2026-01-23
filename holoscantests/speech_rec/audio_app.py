@@ -10,8 +10,8 @@ class SinkOp(Operator):
         spec.input("in")
     
     def compute(self, op_input, op_output, context):
-        # Just consume (transcriber already prints)
-        pass
+        # Must actually receive the input
+        op_input.receive("in")
 
 
 class AudioTranscriptionApp(Application):
@@ -29,7 +29,7 @@ class AudioTranscriptionApp(Application):
         transcriber = WhisperTranscribeOp(
             self,
             name="transcriber",
-            model_name="small",
+            model_name="large",  # Changed from "small"
             device="cpu",
         )
 
