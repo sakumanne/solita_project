@@ -1,5 +1,6 @@
 # scripts/mjpeg_server.py
 import asyncio
+import json
 import cv2
 import numpy as np
 from aiohttp import web
@@ -11,6 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from holoscantests.camera_yolo.spine_overlay import annotate_spine_rgb
 
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
+DEFAULT_STATUS = {
+    "timestamp": None,
+    "transcript": "",
+    "speaker": "",
+    "decibels": None,
+    "loud": False,
+}
 
 async def video_feed(request):
     cap = cv2.VideoCapture(0)  # valitse oikea laite
@@ -22,10 +32,10 @@ async def video_feed(request):
             if not ok:
                 await asyncio.sleep(0.03)
                 continue
-            
+
             # Convert BGR to RGB for annotation
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
+
             try:
                 # Apply spine overlay annotation
                 annotated = annotate_spine_rgb(rgb_frame)
@@ -34,7 +44,7 @@ async def video_feed(request):
             except Exception as e:
                 print(f"Annotation error: {e}")
                 frame_to_encode = frame
-            
+
             ok, buf = cv2.imencode(".jpg", frame_to_encode)
             if not ok:
                 continue
@@ -51,11 +61,21 @@ async def video_feed(request):
     await stream(resp)
     return resp
 
+async def status_handler(request):
+    payload = DEFAULT_STATUS
+    if LATEST_JSON.exists():
+        try:
+            payload = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Status read error: {e}")
+    return web.json_response(payload)
 
 app = web.Application()
 app.router.add_get("/video", video_feed)
+app.router.add_get("/status", status_handler)
 
 if __name__ == "__main__":
-    print("Starting MJPEG server with spine overlay annotation...")
-    print("Video stream available at http://0.0.0.0:5000/video")
+    print("Starting MJPEG server with spine overlay + status API...")
+    print("Video stream:  http://0.0.0.0:5000/video")
+    print("Whisper status: http://0.0.0.0:5000/status")
     web.run_app(app, host="0.0.0.0", port=5000)

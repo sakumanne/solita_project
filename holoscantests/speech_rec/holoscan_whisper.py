@@ -8,6 +8,7 @@ import os
 import queue
 import sys
 import warnings
+import wave
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -167,11 +168,14 @@ def is_chunk_speech(chunk: np.ndarray) -> bool:
 class AudioCaptureOp(Operator):
     """Captures audio from microphone and emits chunks."""
 
-    def __init__(self, *args, chunk_duration: float = CHUNK_SECONDS, **kwargs):
+    def __init__(self, *args, chunk_duration: float = CHUNK_SECONDS, audio_output_path: str = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.chunk_duration = chunk_duration
+        self.audio_output_path = audio_output_path
         self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self.stream = None
+        self.audio_file = None
+        self.recorded_chunks: List[np.ndarray] = []
 
     def setup(self, spec: OperatorSpec):
         spec.output("audio_out")
@@ -194,12 +198,23 @@ class AudioCaptureOp(Operator):
         )
         self.stream.start()
         status(f"Audio capture started: {SAMPLE_RATE}Hz, {self.chunk_duration}s chunks")
+        
+        # Initialize audio file path
+        if not self.audio_output_path:
+            recordings_dir = Path(__file__).parent.parent.parent / "recordings"
+            recordings_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.audio_output_path = str(recordings_dir / f"audio_{timestamp}.wav")
+        
+        print(f"Audio will be saved to: {self.audio_output_path}")
 
     def compute(self, op_input, op_output, context):
         """Get audio chunk from queue and emit."""
         try:
             chunk = self.audio_queue.get(timeout=0.1)
             if chunk is not None and chunk.size > 0:
+                # Record the chunk for saving later
+                self.recorded_chunks.append(chunk.reshape(-1))
                 op_output.emit(chunk.reshape(-1), "audio_out")
         except queue.Empty:
             pass
@@ -210,6 +225,26 @@ class AudioCaptureOp(Operator):
             self.stream.stop()
             self.stream.close()
             status("Audio capture stopped")
+        
+        # Save recorded audio to file
+        if self.recorded_chunks and self.audio_output_path:
+            try:
+                # Concatenate all chunks
+                audio_data = np.concatenate(self.recorded_chunks)
+                # Convert float32 to int16
+                audio_int16 = (np.clip(audio_data, -1, 1) * 32767).astype(np.int16)
+                
+                # Write WAV file
+                with wave.open(self.audio_output_path, 'wb') as wf:
+                    wf.setnchannels(1)  # Mono
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(audio_int16.tobytes())
+                
+                duration = len(audio_data) / SAMPLE_RATE
+                print(f"Audio saved: {self.audio_output_path} ({duration:.1f}s)")
+            except Exception as e:
+                print(f"Error saving audio: {e}", flush=True)
 
 
 class WhisperTranscribeOp(Operator):
