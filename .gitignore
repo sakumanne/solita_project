@@ -3,11 +3,11 @@ __pycache__/
 *.py[cod]
 *.pt
 
-holoscantests/data/keypoints.jsonl
-holoscantests/data/posture.jsonl
-holoscantests/data/live_transcript_latest.json
-holoscantests/data/decibel_log.jsonl
-holoscantests/data/live_transcript.jsonl
+data/keypoints.jsonl
+data/posture.jsonl
+data/live_transcript_latest.json
+data/decibel_log.jsonl
+data/live_transcript.jsonl
 
 # Virtual environments (ignore common names)
 .venv/
