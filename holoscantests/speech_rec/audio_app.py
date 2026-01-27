@@ -16,6 +16,10 @@ class SinkOp(Operator):
 
 class AudioTranscriptionApp(Application):
     """Audio capture + Whisper transcription pipeline."""
+    
+    def __init__(self, *args, audio_output_path: str = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.audio_output_path = audio_output_path
 
     def compose(self):
         # Audio capture operator
@@ -23,6 +27,7 @@ class AudioTranscriptionApp(Application):
             self,
             name="audio_capture",
             chunk_duration=0.5,
+            audio_output_path=self.audio_output_path,
         )
 
         # Whisper transcription operator

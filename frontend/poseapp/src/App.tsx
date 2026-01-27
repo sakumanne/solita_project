@@ -139,7 +139,7 @@ export default function App() {
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch("http://localhost:8001/status");
+        const res = await fetch("http://localhost:5000/status");
         if (!res.ok) {
           setWhisperStatus("error");
           return;
