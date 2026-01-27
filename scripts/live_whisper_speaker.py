@@ -418,39 +418,12 @@ def transcribe_file_with_speakers(model_name: str, device: str = "cpu") -> None:
 # CLI
 # =========================================================
 
-def choose_mode() -> str:
-    while True:
-        print("Valitse tila:")
-        print("1) Live mikrofoni")
-        print("2) Tiedostosta")
-        choice = input("Valinta (1/2): ").strip()
-        if choice in ("1", "2"):
-            return choice
-        print("Anna 1 tai 2.\n")
 
-
-def choose_model() -> str:
-    mapping = {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "large"}
-    print("Valitse Whisper-malli:")
-    print("1) tiny")
-    print("2) base")
-    print("3) small")
-    print("4) medium")
-    print("5) large")
-    choice = input("Valinta (ENTER = small): ").strip()
-    if not choice:
-        return "small"
-    return mapping.get(choice, "small")
 
 
 def main():
-    mode = choose_mode()
-    model_name = choose_model()
-
-    if mode == "2":
-        transcribe_file_with_speakers(model_name=model_name, device="cpu")
-    else:
-        live_transcription(model_name=model_name, device="cpu")
+    # Locked to live microphone + large model.
+    live_transcription(model_name="large", device="cpu")
 
 
 if __name__ == "__main__":

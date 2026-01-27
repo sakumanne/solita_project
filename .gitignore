@@ -5,8 +5,9 @@ __pycache__/
 
 holoscantests/data/keypoints.jsonl
 holoscantests/data/posture.jsonl
-holoscantests/data/live_transcriptions.json
+holoscantests/data/live_transcript_latest.json
 holoscantests/data/decibel_log.jsonl
+holoscantests/data/live_transcript.jsonl
 
 # Virtual environments (ignore common names)
 .venv/
@@ -19,5 +20,4 @@ pyvenv.cfg
 .Python
 # End virtualenv ignores
 
-
-yolov8x-pose.pt
+recordings/

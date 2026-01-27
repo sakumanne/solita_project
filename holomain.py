@@ -117,6 +117,7 @@ def merge_video_audio(video_path, audio_path):
 
 def main():
     print("Starting Holomain - Camera + Audio with Recording")
+
     print("Press Enter to quit\n")
     
     # Generate synchronized output paths

@@ -3,7 +3,94 @@ from holoscan.operators import FormatConverterOp, HolovizOp, V4L2VideoCaptureOp
 from holoscan.operators.v4l2_camera_passthrough import V4L2CameraPassthroughOp
 from holoscan.resources import RMMAllocator
 import numpy as np
+import cv2
+from pathlib import Path
+from datetime import datetime
 from .spine_overlay import annotate_spine_rgb
+
+
+class VideoRecorderOp(Operator):
+    """Records video frames to a file."""
+
+    def __init__(self, *args, output_path: str = None, fps: float = 15.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.output_path = output_path
+        self.fps = fps
+        self.video_writer = None
+        self.frame_count = 0
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("in")
+        spec.output("out")
+
+    def start(self):
+        """Initialize video writer."""
+        if not self.output_path:
+            # Generate default path with timestamp
+            recordings_dir = Path(__file__).parent.parent.parent / "recordings"
+            recordings_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_path = str(recordings_dir / f"video_{timestamp}.mp4")
+        
+        print(f"Video will be saved to: {self.output_path}")
+
+    def compute(self, op_input, op_output, context):
+        frame = op_input.receive("in")
+        if frame is None:
+            op_output.emit(frame, "out")
+            return
+
+        # Extract tensor from frame dict
+        tensor = None
+        if isinstance(frame, dict):
+            for key in frame.keys():
+                tensor = frame[key]
+                break
+        else:
+            tensor = frame
+
+        if tensor is None:
+            op_output.emit(frame, "out")
+            return
+
+        # Convert to numpy array
+        try:
+            try:
+                import cupy as cp
+                gpu_array = cp.asarray(tensor)
+                rgb = cp.asnumpy(gpu_array).astype(np.uint8)
+            except (ImportError, AttributeError):
+                rgb = np.array(tensor, copy=True).astype(np.uint8)
+        except Exception as e:
+            op_output.emit(frame, "out")
+            return
+
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            op_output.emit(frame, "out")
+            return
+
+        # Initialize video writer on first frame
+        if self.video_writer is None:
+            height, width = rgb.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                self.output_path, fourcc, self.fps, (width, height)
+            )
+            print(f"Video recording started: {width}x{height} @ {self.fps}fps")
+
+        # Write frame (OpenCV expects BGR)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        self.video_writer.write(bgr)
+        self.frame_count += 1
+
+        # Pass frame through
+        op_output.emit(frame, "out")
+
+    def stop(self):
+        """Release video writer."""
+        if self.video_writer is not None:
+            self.video_writer.release()
+            print(f"Video recording stopped. Saved {self.frame_count} frames to {self.output_path}")
 
 
 class SpineOverlayOp(Operator):
@@ -61,7 +148,12 @@ class SpineOverlayOp(Operator):
 
 
 class OpenCamera(Application):
-    """V4L2 capture → YUYV→RGB conversion → spine overlay → Holoviz."""
+    """V4L2 capture → YUYV→RGB conversion → spine overlay → video recording → Holoviz."""
+    
+    def __init__(self, *args, video_output_path: str = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.video_output_path = video_output_path
+    
     def compose(self):
         source_args = self.kwargs("source")
         
@@ -94,9 +186,11 @@ class OpenCamera(Application):
 
         passthrough = V4L2CameraPassthroughOp(self, name="passthrough")
         overlay = SpineOverlayOp(self, name="spine_overlay")
+        video_recorder = VideoRecorderOp(self, name="video_recorder", output_path=self.video_output_path)
 
-        # Main flow: passthrough -> visualizer
-        self.add_flow(passthrough, visualizer, {("output", "receivers")})
+        # Main flow: passthrough -> video_recorder -> visualizer
+        self.add_flow(passthrough, video_recorder, {("output", "in")})
+        self.add_flow(video_recorder, visualizer, {("out", "receivers")})
 
         # YUYV path: source -> converter -> overlay -> passthrough
         self.add_flow(source, format_converter, {("signal", "source_video")})
