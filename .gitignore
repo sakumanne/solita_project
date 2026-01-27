@@ -9,6 +9,8 @@ data/live_transcript_latest.json
 data/decibel_log.jsonl
 data/live_transcript.jsonl
 
+yolov8x-pose.pt
+
 # Virtual environments (ignore common names)
 .venv/
 venv/
