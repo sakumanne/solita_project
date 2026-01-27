@@ -1,6 +1,7 @@
 Requirements:
 For pose recognition:
 pip install yolo
+pip install scikit-learn
 
 For voice recognition:
 New system environment variable for token

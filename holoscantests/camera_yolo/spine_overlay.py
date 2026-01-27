@@ -15,13 +15,13 @@ if not YOLO_MODEL_PATH.exists():
 
 KEYPOINT_SIZE = 3
 VIRTUAL_SIZE = 4
-SPINE_THICKNESS = 2
+SPINE_THICKNESS = 1  # Changed from 2 to 1 for thinner lines
 PERSON_COLORS = [
-    (0, 255, 0),
-    (255, 0, 0),
-    (0, 165, 255),
-    (255, 0, 255),
-    (0, 255, 255),
+    (0, 255, 0),      # Green
+    (255, 255, 0),    # Cyan (was red)
+    (0, 165, 255),    # Orange
+    (255, 0, 255),    # Magenta
+    (0, 255, 255),    # Yellow
 ]
 
 # COCO order indices for joints we need
@@ -46,6 +46,10 @@ try:
 except Exception:
     _spine_clf = None
     _neck_clf = None
+print(f"ML Models loaded - Spine: {_spine_clf is not None}, Neck: {_neck_clf is not None}")
+print(f"Model directory: {_ML_MODEL_DIR}")
+print(f"Spine model exists: {(_ML_MODEL_DIR / 'spine_model.joblib').exists()}")
+print(f"Neck model exists: {(_ML_MODEL_DIR / 'neck_model.joblib').exists()}")
 
 
 # -------------- HELPERS --------------
@@ -147,27 +151,40 @@ def _draw_line(img, x0, y0, x1, y1, color, thickness=2):
 def _draw_text(img, text, x, y, color=(255, 0, 0), size=1):
     """Draw text using cv2."""
     cv2.putText(img, str(text), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 
-                size, color, 2)
+                size, color, 1)
 
 
 # -------------- MAIN PUBLIC FUNCTION --------------
 
 def annotate_spine_rgb(rgb_frame):
-    """Takes RGB numpy array, returns RGB with overlays (no cv2)."""
+    """Takes RGB numpy array, returns RGB with overlays with tracking."""
     h, w = rgb_frame.shape[:2]
     annotated = rgb_frame.copy()
 
-    results = _model(rgb_frame, verbose=False)
+    # Use track() instead of predict() for consistent person IDs
+    results = _model.track(rgb_frame, verbose=False, persist=True)
     if len(results) == 0:
         return annotated
 
-    persons = _get_all_person_keypoints(results[0], w, h)
+    result = results[0]
+    
+    # Get tracked boxes with IDs
+    if not hasattr(result, "boxes") or result.boxes is None or len(result.boxes) == 0:
+        return annotated
+    
+    boxes = result.boxes
+    track_ids = boxes.id if hasattr(boxes, "id") and boxes.id is not None else None
+    
+    persons = _get_all_person_keypoints(result, w, h)
     if not persons:
         return annotated
 
     # First pass: analyze all people to get posture data
     people_analysis = []
     for idx, kpt_norm in enumerate(persons):
+        # Get tracked ID or use index as fallback
+        track_id = int(track_ids[idx].item()) if track_ids is not None else idx + 1
+        
         # Convert to absolute coords for analysis
         abs_kp = []
         for (xn, yn, conf) in kpt_norm:
@@ -180,19 +197,12 @@ def annotate_spine_rgb(rgb_frame):
                 vsp_abs.append([float(vx * w), float(vy * h), float(vc)])
 
         posture = spine_math.analyze_person_posture(abs_kp, vsp_abs) if vsp_abs else None
-        people_analysis.append((kpt_norm, vsp_norm, posture))
+        people_analysis.append((track_id, kpt_norm, vsp_norm, posture))
 
-    # Second pass: draw with colors based on posture
-    for idx, (kpt_norm, spine_pts, posture) in enumerate(people_analysis, start=1):
-        # Use RED if bad posture, otherwise normal color
-        is_bad = False
-        if posture:
-            is_bad = posture.get("bad_posture_ml", posture.get("bad_posture", False))
-        
-        if is_bad:
-            color = (255, 0, 0)  # RED for bad posture
-        else:
-            color = PERSON_COLORS[(idx - 1) % len(PERSON_COLORS)]
+    # Second pass: draw with colors based on track ID
+    for track_id, kpt_norm, spine_pts, posture in people_analysis:
+        # Each tracked person gets their own color based on track ID
+        color = PERSON_COLORS[(track_id - 1) % len(PERSON_COLORS)]
 
         # Draw original YOLO keypoints
         for (xn, yn, conf) in kpt_norm:
@@ -211,36 +221,32 @@ def annotate_spine_rgb(rgb_frame):
             pix_points.append((px, py))
             _draw_square(annotated, px, py, VIRTUAL_SIZE, color)
 
-        # Connect spine with lines - thicker red if bad posture
-        thickness = SPINE_THICKNESS * 2 if is_bad else SPINE_THICKNESS
+        # Connect spine with lines - consistent thin thickness
         for i in range(len(pix_points) - 1):
             x0, y0 = pix_points[i]
             x1, y1 = pix_points[i + 1]
-            _draw_line(annotated, x0, y0, x1, y1, color, thickness=thickness)
+            _draw_line(annotated, x0, y0, x1, y1, color, thickness=1)
 
         # Draw warning indicators if bad posture
+        is_bad = False
+        if posture:
+            is_bad = posture.get("bad_posture_ml", posture.get("bad_posture", False))
+        
         if is_bad:
             warnings = posture.get("warnings", [])
             nose_x, nose_y = int(kpt_norm[0][0] * w), int(kpt_norm[0][1] * h)
 
-            # Draw red warning square above head
-            _draw_square(annotated, nose_x, max(nose_y - 30, 10), 8, (255, 0, 0))
-
-            # Draw warning bars for each issue
-            warning_y = max(nose_y - 50, 20)
+            # Draw warning text above head
+            warning_y = max(nose_y - 60, 20)
             for i, warning in enumerate(warnings):
-                bar_y = warning_y - (i * 15)
-                if bar_y > 0:
-                    # Draw colored warning bar
-                    bar_len = 60
-                    bar_x = nose_x - bar_len // 2
-                    for x in range(max(0, bar_x), min(w, bar_x + bar_len)):
-                        for y in range(max(0, bar_y), min(h, bar_y + 10)):
-                            annotated[y, x] = (255, 100, 0)  # Orange warning bar
+                text_y = warning_y - (i * 25)
+                if text_y > 10:
+                    _draw_text(annotated, warning, nose_x - 50, text_y, 
+                              color=(0, 0, 255), size=0.4)
 
-        # Draw person ID
+        # Draw person ID (tracked ID, not index)
         nose_x, nose_y = int(kpt_norm[0][0] * w), int(kpt_norm[0][1] * h)
-        _draw_text(annotated, f"ID:{idx}", nose_x - 20, max(nose_y - 40, 20), 
+        _draw_text(annotated, f"ID:{track_id}", nose_x - 20, max(nose_y - 40, 20), 
                    color=color, size=1)
 
     # record all detected people (absolute coords) to data/keypoints.jsonl
@@ -268,7 +274,7 @@ def annotate_spine(bgr_frame):
 _frame_counter = 0
 
 def _get_project_data_path(filename: str = "keypoints.jsonl"):
-    base = Path(__file__).resolve().parents[1]  # project root is one level up from holoscantests
+    base = Path(__file__).resolve().parents[2]  # Go up 2 levels: camera_yolo -> holoscantests -> solita_project
     out_dir = base / "data"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / filename
