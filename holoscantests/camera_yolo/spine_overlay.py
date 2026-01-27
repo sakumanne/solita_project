@@ -3,10 +3,12 @@ import numpy as np
 from ultralytics import YOLO
 import time
 import json
+import joblib
 from holoscantests.camera_yolo import spine_math
+import cv2
 
 # ---------------- CONFIG ----------------
-# Change this to your model path (e.g. Pose_ai.pt or best.pt)
+# Skeleton model path
 YOLO_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "weights_coco8" / "best.pt"
 if not YOLO_MODEL_PATH.exists():
     raise FileNotFoundError(f"Weights not found: {YOLO_MODEL_PATH}")
@@ -33,6 +35,17 @@ VIRTUAL_SPINE_NAMES = ["CERVICAL_BASE", "THORACIC_MID", "LUMBAR_BASE", "SACRUM"]
 
 # -------------- MODEL LOAD (ONCE) --------------
 _model = YOLO(str(YOLO_MODEL_PATH))
+
+# Posture analyzing model
+_ML_MODEL_DIR = Path(__file__).resolve().parents[2] / "holoscantests" / "runs"/ "models"
+_spine_clf = None
+_neck_clf = None
+try:
+    _spine_clf = joblib.load(_ML_MODEL_DIR / "spine_model.joblib")
+    _neck_clf = joblib.load(_ML_MODEL_DIR / "neck_model.joblib")
+except Exception:
+    _spine_clf = None
+    _neck_clf = None
 
 
 # -------------- HELPERS --------------
@@ -132,20 +145,9 @@ def _draw_line(img, x0, y0, x1, y1, color, thickness=2):
 
 
 def _draw_text(img, text, x, y, color=(255, 0, 0), size=1):
-    """Draw simple text using squares (bitmap-style) since we don't have cv2."""
-    # Simple implementation: just draw a colored bar with indicator
-    # For actual text, you'd need a font renderer or cv2
-    # For now, draw a colored rectangle as warning indicator
-    h, w, _ = img.shape
-    bar_width = len(text) * 8 * size
-    bar_height = 12 * size
-    x0 = max(0, x - bar_width // 2)
-    x1 = min(w, x0 + bar_width)
-    y0 = max(0, y)
-    y1 = min(h, y + bar_height)
-
-    # Draw semi-transparent warning bar
-    img[y0:y1, x0:x1] = color
+    """Draw text using cv2."""
+    cv2.putText(img, str(text), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 
+                size, color, 2)
 
 
 # -------------- MAIN PUBLIC FUNCTION --------------
@@ -183,7 +185,11 @@ def annotate_spine_rgb(rgb_frame):
     # Second pass: draw with colors based on posture
     for idx, (kpt_norm, spine_pts, posture) in enumerate(people_analysis, start=1):
         # Use RED if bad posture, otherwise normal color
-        if posture and posture.get("bad_posture", False):
+        is_bad = False
+        if posture:
+            is_bad = posture.get("bad_posture_ml", posture.get("bad_posture", False))
+        
+        if is_bad:
             color = (255, 0, 0)  # RED for bad posture
         else:
             color = PERSON_COLORS[(idx - 1) % len(PERSON_COLORS)]
@@ -206,14 +212,14 @@ def annotate_spine_rgb(rgb_frame):
             _draw_square(annotated, px, py, VIRTUAL_SIZE, color)
 
         # Connect spine with lines - thicker red if bad posture
-        thickness = SPINE_THICKNESS * 2 if (posture and posture.get("bad_posture", False)) else SPINE_THICKNESS
+        thickness = SPINE_THICKNESS * 2 if is_bad else SPINE_THICKNESS
         for i in range(len(pix_points) - 1):
             x0, y0 = pix_points[i]
             x1, y1 = pix_points[i + 1]
             _draw_line(annotated, x0, y0, x1, y1, color, thickness=thickness)
 
         # Draw warning indicators if bad posture
-        if posture and posture.get("bad_posture", False):
+        if is_bad:
             warnings = posture.get("warnings", [])
             nose_x, nose_y = int(kpt_norm[0][0] * w), int(kpt_norm[0][1] * h)
 
@@ -231,6 +237,11 @@ def annotate_spine_rgb(rgb_frame):
                     for x in range(max(0, bar_x), min(w, bar_x + bar_len)):
                         for y in range(max(0, bar_y), min(h, bar_y + 10)):
                             annotated[y, x] = (255, 100, 0)  # Orange warning bar
+
+        # Draw person ID
+        nose_x, nose_y = int(kpt_norm[0][0] * w), int(kpt_norm[0][1] * h)
+        _draw_text(annotated, f"ID:{idx}", nose_x - 20, max(nose_y - 40, 20), 
+                   color=color, size=1)
 
     # record all detected people (absolute coords) to data/keypoints.jsonl
     global _frame_counter
@@ -288,6 +299,21 @@ def _build_people_records_from_result(result, img_w: int, img_h: int):
 
         # ANALYZE POSTURE
         posture = spine_math.analyze_person_posture(abs_kp, vsp_abs) if vsp_abs else None
+        
+        # Apply ML classifiers if available
+        if posture and _spine_clf is not None and _neck_clf is not None:
+            try:
+                feats = [
+                    posture["tilt_deg"],
+                    posture["curvature_deg"],
+                    posture["head_offset"],
+                    posture["neck_flexion_deg"],
+                ]
+                posture["ml_spine_bad"] = bool(_spine_clf.predict([feats])[0])
+                posture["ml_neck_bad"] = bool(_neck_clf.predict([feats])[0])
+                posture["bad_posture_ml"] = posture["ml_spine_bad"] or posture["ml_neck_bad"]
+            except Exception:
+                pass
 
         people.append({
             "id": int(pid),
