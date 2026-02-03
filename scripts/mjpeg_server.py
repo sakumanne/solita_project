@@ -68,7 +68,9 @@ async def status_handler(request):
             payload = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"Status read error: {e}")
-    return web.json_response(payload)
+    response = web.json_response(payload)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
 
 app = web.Application()
 app.router.add_get("/video", video_feed)
