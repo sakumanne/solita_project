@@ -8,9 +8,6 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, List, Tuple, Optional
 from contextlib import contextmanager
-import json
-from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -62,8 +59,6 @@ warnings.filterwarnings(
     message=r"resource_tracker: There appear to be .* leaked semaphore objects.*"
 )
 
-DATA_DIR = Path(__file__).parent.parent / "data"
-LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
 
 def status(msg: str) -> None:
     print(f"STATUS: {msg}", flush=True)
@@ -115,19 +110,6 @@ def postprocess(text: str) -> str:
             chars[i] = c.upper()
             break
     return "".join(chars)
-
-def write_status(transcript: str, speaker: str) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    status_data = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "transcript": transcript or "",
-        "speaker": speaker,
-        "decibels": None,
-        "loud": False,
-    }
-    with open(LATEST_JSON, "w", encoding="utf-8") as f:
-        json.dump(status_data, f, ensure_ascii=False, indent=2)
-
 
 
 # =========================================================
@@ -328,9 +310,7 @@ def _flush_and_print(model, speaker_state: SpeakerState, buf: List[np.ndarray]) 
 
     text = transcribe_audio(model, utter)
     if text:
-        speaker = speaker_label(spk)
-        print(f"{speaker}: {text}")
-        write_status(text, speaker)
+        print(f"{speaker_label(spk)}: {text}")
 
 
 def live_transcription(model_name: str, device: str = "cpu") -> None:
