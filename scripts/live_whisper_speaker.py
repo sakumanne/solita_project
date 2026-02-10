@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
 import sys
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any, List, Tuple, Optional
 from contextlib import contextmanager
 
@@ -19,6 +22,9 @@ import torch
 # =========================================================
 # ASETUKSET
 # =========================================================
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LATEST_JSON = DATA_DIR / "live_transcript_latest.json"
 
 SAMPLE_RATE = 16_000
 CHUNK_SECONDS = 0.5
@@ -110,6 +116,20 @@ def postprocess(text: str) -> str:
             chars[i] = c.upper()
             break
     return "".join(chars)
+
+
+def write_status(transcript: str, speaker: str) -> None:
+    """Write latest transcript status to JSON file."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    status_data = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "transcript": transcript or "",
+        "speaker": speaker,
+        "decibels": None,
+        "loud": False,
+    }
+    with open(LATEST_JSON, "w", encoding="utf-8") as f:
+        json.dump(status_data, f, ensure_ascii=False, indent=2)
 
 
 # =========================================================
@@ -310,7 +330,9 @@ def _flush_and_print(model, speaker_state: SpeakerState, buf: List[np.ndarray]) 
 
     text = transcribe_audio(model, utter)
     if text:
-        print(f"{speaker_label(spk)}: {text}")
+        speaker = speaker_label(spk)
+        print(f"{speaker}: {text}")
+        write_status(text, speaker)
 
 
 def live_transcription(model_name: str, device: str = "cpu") -> None:

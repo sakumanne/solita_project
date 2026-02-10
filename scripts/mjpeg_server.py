@@ -21,6 +21,14 @@ DEFAULT_STATUS = {
     "decibels": None,
     "loud": False,
 }
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+async def options_handler(request):
+    return web.Response(status=200, headers=CORS_HEADERS)
 
 async def video_feed(request):
     cap = cv2.VideoCapture(0)  # valitse oikea laite
@@ -68,12 +76,13 @@ async def status_handler(request):
             payload = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"Status read error: {e}")
-    return web.json_response(payload)
+    return web.json_response(payload, headers=CORS_HEADERS)
 
 app = web.Application()
 app.router.add_get("/video", video_feed)
 app.router.add_get("/status", status_handler)
-
+app.router.add_options("/video", options_handler)
+app.router.add_options("/status", options_handler)
 if __name__ == "__main__":
     print("Starting MJPEG server with spine overlay + status API...")
     print("Video stream:  http://0.0.0.0:5000/video")
